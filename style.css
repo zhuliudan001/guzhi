@@ -148,7 +148,7 @@ body {
     font-weight: 500;
 }
 
-.status-indicator i {
+.status-indicator .svg-icon {
     font-size: 0.75rem;
 }
 
@@ -157,7 +157,7 @@ body {
     color: var(--green-600);
 }
 
-.status-trading i {
+.status-trading .svg-icon {
     animation: pulse 2s infinite;
 }
 
@@ -759,6 +759,8 @@ body {
 .icon-btn.drag-handle {
     cursor: grab;
     color: var(--gray-300);
+    touch-action: none;
+    user-select: none;
 }
 
 .icon-btn.drag-handle:hover {
@@ -949,8 +951,35 @@ body {
 }
 
 .dialog-header {
+    position: relative;
     padding: 1.5rem 1.5rem 0;
     text-align: center;
+}
+
+.dialog-close {
+    position: absolute;
+    top: 0.75rem;
+    right: 0.75rem;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border: none;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--gray-400);
+    cursor: pointer;
+}
+
+.dialog-close:hover {
+    background: var(--gray-100);
+    color: var(--gray-700);
+}
+
+.dialog-close .svg-icon {
+    width: 18px;
+    height: 18px;
 }
 
 .dialog-icon {
@@ -1374,9 +1403,24 @@ body {
         display: block;
     }
 
+    .card-header {
+        flex-wrap: wrap;
+        gap: 0.75rem;
+    }
+
     .section-controls {
         width: 100%;
-        justify-content: space-between;
+        flex-wrap: wrap;
+        justify-content: flex-start;
+    }
+
+    .section-controls .btn {
+        justify-content: center;
+    }
+
+    .refresh-toggle {
+        margin-left: auto;
+        white-space: nowrap;
     }
 
     .nav-status {

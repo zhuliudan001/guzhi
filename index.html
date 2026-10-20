@@ -110,7 +110,7 @@
                             <input type="checkbox" id="autoRefreshSwitch">
                             <span class="toggle-track"></span>
                         </label>
-                        <span id="refreshInterval">2分钟</span>
+                        <span id="refreshInterval">5分钟</span>
                     </div>
                 </div>
             </div>
@@ -130,11 +130,11 @@
                         <thead>
                             <tr>
                                 <th style="padding-left: 2.5rem;">基金信息</th>
-                                <th style="text-align: right;">最新净值</th>
-                                <th style="text-align: right;">估算涨跌</th>
+                                <th style="text-align: right;">参考净值</th>
+                                <th style="text-align: right;">估算涨幅</th>
                                 <th style="text-align: right;">日涨跌</th>
                                 <th>净值日期</th>
-                                <th style="text-align: right;">持有收益</th>
+                                <th style="text-align: right;">估算收益</th>
                                 <th style="text-align: center;">操作</th>
                             </tr>
                         </thead>
@@ -160,9 +160,10 @@
 
     <!-- 底部 -->
     <footer class="footer">
-        <p>基金估值仅供参考，实际净值以基金公司公布为准<br>数据来源：东方财富基金</p>
+        <p>盘中估值为按持仓或关联行情测算的参考值，实际净值以基金公司公布为准<br>数据来源：东方财富基金 / 天天基金</p>
     </footer>
 
+    <script src="app-utils.js"></script>
     <script src="app.js"></script>
 </body>
 

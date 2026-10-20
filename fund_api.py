@@ -7,12 +7,19 @@
 
 import logging
 import json
+import math
 import re
+import threading
+import time
 import traceback
-from flask import Flask, jsonify, request
-import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, date, timedelta
+from datetime import date, datetime, timedelta, timezone
+
+import requests
+from flask import Flask, jsonify, request
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from werkzeug.exceptions import HTTPException
 
 # 配置日志
 logging.basicConfig(
@@ -23,13 +30,17 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# CORS 配置 - 支持多环境
-ALLOWED_ORIGINS = ['https://guzhi.itect.me', 'http://localhost:8080', 'http://localhost:5000']
+# CORS 配置 - 生产域名 + 任意本地端口（本地调试时静态服务端口不固定）
+ALLOWED_ORIGINS = {'https://guzhi.itect.me'}
+LOCAL_ORIGIN_RE = re.compile(r'^http://(localhost|127\.0\.0\.1)(:\d+)?$')
+
+def _origin_allowed(origin):
+    return bool(origin) and (origin in ALLOWED_ORIGINS or LOCAL_ORIGIN_RE.match(origin))
 
 @app.after_request
 def add_cors_headers(response):
     origin = request.headers.get('Origin')
-    if origin in ALLOWED_ORIGINS:
+    if _origin_allowed(origin):
         response.headers['Access-Control-Allow-Origin'] = origin
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
@@ -44,37 +55,276 @@ app.config['DEBUG'] = False
 
 # 常量定义
 API_TIMEOUT = 10  # 请求超时时间（秒）
-# 天天基金净值接口（替代已废弃的 fundgz 接口）
+# 天天基金净值接口
 TARGET_URL = 'https://api.fund.eastmoney.com/f10/lsjz?callback=jQuery&fundCode={code}&pageIndex=1&pageSize=1'
 # 基金搜索接口（获取基金名称）
 SEARCH_URL = 'https://fundsuggest.eastmoney.com/FundSearch/api/FundSearchAPI.ashx?callback=jQuery&m=1&key={code}'
-MAX_BATCH_SIZE = 20  # 批量请求最大数量
+# 天天基金批量估值接口
+FAST_URL = (
+    'https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast'
+    '?FCODES={codes}&FIELDS=FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE,NAVCHGRT'
+)
+MAX_BATCH_SIZE = 20
+FAST_BATCH_SIZE = 50
+
+META_CACHE_TTL = 6 * 60 * 60
+FAST_CACHE_TTL = 60
+NAV_CACHE_TTL = 5 * 60
+DETAIL_CACHE_TTL = 5 * 60
+
+SHANGHAI_TZ = timezone(timedelta(hours=8), 'Asia/Shanghai')
+
+DEFAULT_HEADERS = {
+    'User-Agent': (
+        'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+        '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    ),
+    'Referer': 'https://fund.eastmoney.com/',
+}
+
+# A 股休市日（国务院节假日安排；跨年时需补充下一年度）
+HOLIDAYS = {
+    # 2025
+    date(2025, 1, 1),
+    date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
+    date(2025, 1, 31), date(2025, 2, 1), date(2025, 2, 2), date(2025, 2, 3),
+    date(2025, 4, 4), date(2025, 4, 5), date(2025, 4, 6),
+    date(2025, 5, 1), date(2025, 5, 2), date(2025, 5, 3), date(2025, 5, 4), date(2025, 5, 5),
+    date(2025, 5, 31), date(2025, 6, 1), date(2025, 6, 2),
+    date(2025, 10, 1), date(2025, 10, 2), date(2025, 10, 3), date(2025, 10, 4),
+    date(2025, 10, 5), date(2025, 10, 6), date(2025, 10, 7),
+    # 2026
+    date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3),
+    date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19), date(2026, 2, 20),
+    date(2026, 2, 21), date(2026, 2, 22), date(2026, 2, 23),
+    date(2026, 4, 5), date(2026, 4, 6), date(2026, 4, 7),
+    date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3),
+    date(2026, 6, 19), date(2026, 6, 20), date(2026, 6, 21),
+    date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 27),
+    date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3), date(2026, 10, 4),
+    date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7),
+}
+
+STATUS_TEXT = {
+    'pre_open': '待开盘',
+    'trading': '交易中',
+    'lunch_break': '午间休市',
+    'closed_today': '今日休市',
+    'weekend': '周末休市',
+    'holiday': '节假日休市',
+}
+
+
+class FundNotFoundError(LookupError):
+    """基金不存在或已停止披露净值。"""
+
+
+class UpstreamError(RuntimeError):
+    """上游数据源不可用或返回异常。"""
+
+
+class TTLCache:
+    """带过期时间和容量上限的线程安全缓存。"""
+
+    def __init__(self, ttl=60, clock=time.monotonic, max_size=512):
+        self.ttl = ttl
+        self._clock = clock
+        self._max_size = max_size
+        self._data = {}
+        self._lock = threading.Lock()
+
+    def get(self, key):
+        with self._lock:
+            item = self._data.get(key)
+            if item is None:
+                return None
+            expires_at, value = item
+            if self._clock() >= expires_at:
+                self._data.pop(key, None)
+                return None
+            return value
+
+    def set(self, key, value, ttl=None):
+        lifetime = self.ttl if ttl is None else ttl
+        with self._lock:
+            if len(self._data) >= self._max_size:
+                now = self._clock()
+                for expired in [k for k, (exp, _) in self._data.items() if exp <= now]:
+                    self._data.pop(expired, None)
+                if len(self._data) >= self._max_size:
+                    oldest = min(self._data, key=lambda k: self._data[k][0])
+                    self._data.pop(oldest, None)
+            self._data[key] = (self._clock() + lifetime, value)
+
+    def clear(self):
+        with self._lock:
+            self._data.clear()
+
+
+META_CACHE = TTLCache(ttl=META_CACHE_TTL)
+FAST_CACHE = TTLCache(ttl=FAST_CACHE_TTL)
+NAV_CACHE = TTLCache(ttl=NAV_CACHE_TTL)
+DETAIL_CACHE = TTLCache(ttl=DETAIL_CACHE_TTL)
+
+_thread_local = threading.local()
+
+
+def _get_session():
+    session = getattr(_thread_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        retry = Retry(
+            total=2,
+            connect=2,
+            read=2,
+            backoff_factor=0.3,
+            status_forcelist=(429, 500, 502, 503, 504),
+            allowed_methods=frozenset(['GET']),
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+        session.mount('https://', adapter)
+        session.mount('http://', adapter)
+        _thread_local.session = session
+    return session
+
+
+def http_get(url, **kwargs):
+    kwargs.setdefault('timeout', API_TIMEOUT)
+    kwargs.setdefault('headers', DEFAULT_HEADERS)
+    return _get_session().get(url, **kwargs)
+
+
+def _validate_code(code):
+    if not isinstance(code, str) or len(code) != 6 or not code.isdigit():
+        raise ValueError('无效的基金代码，请输入 6 位数字')
+    return code
+
+
+def _to_float(value):
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        if isinstance(value, str):
+            text = value.strip().replace(',', '').replace('%', '')
+            if not text or text == '--':
+                return None
+            number = float(text)
+        else:
+            number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _fmt_nav(value):
+    number = _to_float(value)
+    return f'{number:.4f}' if number is not None else '--'
+
+
+def _fmt_num(value):
+    number = _to_float(value)
+    return f'{number:.2f}' if number is not None else '--'
+
+
+def _extract_json(text):
+    if not text:
+        return None
+    start = text.find('{')
+    end = text.rfind('}') + 1
+    if start < 0 or end <= start:
+        return None
+    try:
+        return json.loads(text[start:end])
+    except (TypeError, ValueError):
+        return None
+
+
+def _next_trading_day(start):
+    day = start
+    while day.weekday() >= 5 or day in HOLIDAYS:
+        day += timedelta(days=1)
+    return day
+
+
+def _market_status(now=None):
+    """返回上海时区下的 A 股交易状态。"""
+    if now is None:
+        now = datetime.now(SHANGHAI_TZ)
+    elif now.tzinfo is None:
+        now = now.replace(tzinfo=SHANGHAI_TZ)
+    else:
+        now = now.astimezone(SHANGHAI_TZ)
+
+    current_date = now.date()
+    is_weekend = current_date.weekday() >= 5
+    is_holiday = current_date in HOLIDAYS
+    is_trading_day = not is_weekend and not is_holiday
+    minutes = now.hour * 60 + now.minute
+
+    if not is_trading_day:
+        status = 'weekend' if is_weekend else 'holiday'
+        is_trading = False
+        next_open = f'{_next_trading_day(current_date + timedelta(days=1))} 09:30'
+    elif minutes < 9 * 60 + 30:
+        status = 'pre_open'
+        is_trading = False
+        next_open = f'{current_date} 09:30'
+    elif minutes <= 11 * 60 + 30:
+        status = 'trading'
+        is_trading = True
+        next_open = None
+    elif minutes < 13 * 60:
+        status = 'lunch_break'
+        is_trading = False
+        next_open = f'{current_date} 13:00'
+    elif minutes < 15 * 60:
+        status = 'trading'
+        is_trading = True
+        next_open = None
+    else:
+        status = 'closed_today'
+        is_trading = False
+        next_open = f'{_next_trading_day(current_date + timedelta(days=1))} 09:30'
+
+    return {
+        'status': status,
+        'status_text': STATUS_TEXT[status],
+        'is_trading': is_trading,
+        'is_trading_day': is_trading_day,
+        'is_holiday': is_holiday,
+        'is_weekend': is_weekend,
+        'current_time': now.strftime('%Y-%m-%d %H:%M:%S'),
+        'next_open': next_open,
+        'suggested_refresh_interval': 60000 if is_trading else 300000,
+    }
+
+
+def _api_error(message, status):
+    return jsonify({'success': False, 'error': message}), status
+
+
+@app.errorhandler(FundNotFoundError)
+def handle_fund_not_found(e):
+    return _api_error(str(e) or '未找到基金', 404)
+
+
+@app.errorhandler(UpstreamError)
+def handle_upstream_error(e):
+    logger.warning(f"上游数据源异常：{e}")
+    return _api_error(str(e) or '数据源暂时不可用', 502)
+
+
+@app.errorhandler(HTTPException)
+def handle_http_exception(e):
+    return _api_error(e.description or e.name, e.code or 500)
 
 
 @app.errorhandler(Exception)
 def handle_exception(e):
-    """
-    全局异常处理器，捕获所有未处理的异常
-    确保不暴露任何技术细节
-    """
+    """兜底异常处理，避免把堆栈或内部细节返回给前端。"""
     logger.error(f"未处理的异常：{str(e)}\n{traceback.format_exc()}")
-
-    # 检查错误信息是否包含敏感内容
-    error_msg = str(e)
-    sensitive_keywords = ['fundgz', '1234567.com', 'api.fund.eastmoney']
-
-    if any(keyword in error_msg.lower() for keyword in sensitive_keywords):
-        # 包含敏感信息，返回通用错误
-        return jsonify({
-            'success': False,
-            'error': '服务器内部错误，请稍后重试'
-        }), 500
-
-    # 不包含敏感信息，返回原始消息
-    return jsonify({
-        'success': False,
-        'error': error_msg if error_msg else '服务器内部错误，请稍后重试'
-    }), 500
+    return _api_error('服务器内部错误，请稍后重试', 500)
 
 
 def _get_etf_realtime_change(fund_name, headers):
@@ -569,167 +819,286 @@ def get_fund_stock_estimate(code):
     return result
 
 
-def get_fund_data(code):
-    """
-    获取基金数据
+def get_fund_meta(code):
+    """获取基金名称与类型，结果缓存 6 小时。"""
+    cached = META_CACHE.get(code)
+    if cached is not None:
+        return cached
 
-    Args:
-        code (str): 6 位基金代码
-
-    Returns:
-        dict: 基金数据
-
-    Raises:
-        Exception: 当数据获取失败时抛出友好的错误信息
-    """
+    meta = {}
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
-            'Referer': 'https://fund.eastmoney.com/'
-        }
+        response = http_get(SEARCH_URL.format(code=code))
+        if response.status_code == 200:
+            data = _extract_json(response.text)
+            items = (data or {}).get('Datas') or []
+            for item in items:
+                # 搜索接口会混入股票/债券，只接受代码精确匹配且有基金基础信息的条目
+                code_match = str(item.get('CODE') or '') == code or str(item.get('BACKCODE') or '') == code
+                base = item.get('FundBaseInfo')
+                if not code_match or not isinstance(base, dict) or not base:
+                    continue
+                meta = {
+                    'name': item.get('NAME', ''),
+                    'type': base.get('FTYPE', ''),
+                }
+                break
+    except requests.RequestException as exc:
+        logger.warning(f"获取基金 {code} 基础信息失败：{exc}")
 
-        # 第一步：获取基金名称
-        fund_name = ''
-        fund_type = ''
-        search_url = SEARCH_URL.format(code=code)
-        try:
-            search_resp = requests.get(search_url, headers=headers, timeout=API_TIMEOUT)
-            if search_resp.status_code == 200:
-                search_body = search_resp.text
-                # 解析 JSONP
-                start = search_body.find('{')
-                end = search_body.rfind('}') + 1
-                if start != -1 and end > start:
-                    search_json = search_body[start:end]
-                    search_data = json.loads(search_json)
-                    if search_data.get('Datas') and len(search_data['Datas']) > 0:
-                        fund_info = search_data['Datas'][0]
-                        fund_name = fund_info.get('NAME', '')
-                        base_info = fund_info.get('FundBaseInfo', {})
-                        if base_info:
-                            fund_type = base_info.get('FTYPE', '')
-        except Exception:
-            pass
+    META_CACHE.set(code, meta, META_CACHE_TTL if meta.get('name') else 60)
+    return meta
 
-        # 第二步：获取基金净值数据
-        url = TARGET_URL.format(code=code)
-        response = requests.get(url, headers=headers, timeout=API_TIMEOUT)
 
-        if response.status_code == 404:
-            return None
-        elif response.status_code >= 500:
-            raise Exception('数据源服务异常，请稍后重试')
-        elif response.status_code != 200:
-            return None
+def get_fund_nav(code):
+    """获取最新披露净值，结果缓存 5 分钟。"""
+    cached = NAV_CACHE.get(code)
+    if cached is not None:
+        return cached
 
-        content = response.text.strip()
-        if not content:
-            return None
+    try:
+        response = http_get(TARGET_URL.format(code=code))
+    except requests.RequestException as exc:
+        raise UpstreamError('数据源连接失败，请稍后重试') from exc
 
-        # 提取 JSON 数据 (格式：jQuery({...}))
-        if content.startswith('jQuery(') and content.endswith(')'):
-            json_str = content[7:-1]
-        else:
-            return None
+    if response.status_code == 404:
+        raise FundNotFoundError(f'未找到基金 {code}，请检查代码是否正确')
+    if response.status_code >= 500:
+        raise UpstreamError('数据源服务异常，请稍后重试')
+    if response.status_code != 200:
+        raise UpstreamError('数据源返回异常状态')
 
-        data = json.loads(json_str)
+    data = _extract_json(response.text)
+    if data is None:
+        raise UpstreamError('数据解析失败，请稍后重试')
+    if data.get('ErrCode') not in (0, '0'):
+        raise FundNotFoundError(f'未找到基金 {code}，请检查代码是否正确')
 
-        if not data or data.get('ErrCode') != 0:
-            return None
+    nav_items = (data.get('Data') or {}).get('LSJZList') or []
+    if not nav_items:
+        raise FundNotFoundError(f'基金 {code} 暂无净值数据')
 
-        lsjz_list = data.get('Data', {}).get('LSJZList', [])
-        if not lsjz_list:
-            return None
+    NAV_CACHE.set(code, nav_items[0], NAV_CACHE_TTL)
+    return nav_items[0]
 
-        nav_data = lsjz_list[0]
 
-        # 第三步：获取重仓股估算涨跌幅
-        estimate = get_fund_stock_estimate(code)
+def _parse_fast_record(item):
+    estimated_nav = _to_float(item.get('GSZ'))
+    estimated_change = _to_float(item.get('GSZZL'))
+    has_estimate = estimated_nav is not None and estimated_change is not None
+    return {
+        'code': item.get('FCODE', ''),
+        'name': item.get('SHORTNAME', ''),
+        'nav': _to_float(item.get('NAV')),
+        'nav_date': item.get('PDATE') or '--',
+        'nav_change': _to_float(item.get('NAVCHGRT')),
+        'estimated_nav': estimated_nav,
+        'estimated_change': estimated_change,
+        'estimate_time': item.get('GZTIME') or '--',
+        'has_estimate': has_estimate,
+        'has_realtime': has_estimate,
+    }
 
-        # 使用重仓股估算涨跌幅（如果可用）
-        estimated_change = estimate.get('estimated_change')
-        gszzl = str(estimated_change) if estimated_change is not None else str(nav_data.get('JZZZL', 0))
-        jzzzl = str(nav_data.get('JZZZL', 0))  # 净值日期的实际涨跌幅
 
-        result = {
+def get_fast_valuations(codes):
+    """批量获取盘中估值，60 秒缓存。上游失败时返回空字典，由调用方降级。"""
+    unique_codes = list(dict.fromkeys(c for c in codes if c))
+    if not unique_codes:
+        return {}
+
+    cache_key = ','.join(sorted(unique_codes))
+    cached = FAST_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    records = {}
+    try:
+        response = http_get(FAST_URL.format(codes=cache_key))
+        payload = response.json()
+        if isinstance(payload, dict) and payload.get('success'):
+            for item in payload.get('data') or []:
+                record = _parse_fast_record(item)
+                if record['code']:
+                    records[record['code']] = record
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.warning(f"批量估值获取失败：{exc}")
+        FAST_CACHE.set(cache_key, {}, 15)
+        return {}
+
+    FAST_CACHE.set(cache_key, records, FAST_CACHE_TTL)
+    return records
+
+
+def get_fast_valuation(code):
+    return get_fast_valuations([code]).get(code)
+
+
+def _valuation_payload(record):
+    """把内部估值记录转换为前端使用的基础字段。"""
+    return {
+        'code': record.get('code', ''),
+        'name': record.get('name', ''),
+        'gsz': _fmt_nav(record.get('estimated_nav')),
+        'gszzl': _fmt_num(record.get('estimated_change')),
+        'jzzzl': _fmt_num(record.get('nav_change')),
+        'dwjz': _fmt_nav(record.get('nav')),
+        'gztime': record.get('estimate_time') or '--',
+        'jzrq': record.get('nav_date') or '--',
+        'source': 'tiantian',
+        'has_estimate': bool(record.get('has_estimate')),
+        'has_realtime': bool(record.get('has_realtime')),
+        'estimated_change': record.get('estimated_change'),
+    }
+
+
+def _build_basic_payload(code, meta, fast, nav):
+    """合并搜索信息、盘中估值与最新净值。
+
+    gsz 始终表示“当前参考净值”：有估值时为估算净值，否则为最新披露净值。
+    """
+    meta = meta or {}
+    nav = nav or {}
+    name = meta.get('name') or (fast or {}).get('name') or ''
+
+    if fast and fast.get('has_estimate'):
+        return {
             'code': code,
-            'name': fund_name,
-            'type': fund_type,
-            'gsz': str(nav_data.get('DWJZ', '--')),  # 最新净值
-            'gszzl': gszzl,  # 涨跌幅（优先使用估算值）
-            'jzzzl': jzzzl,  # 净值日期实际涨跌幅
-            'gztime': nav_data.get('FSRQ', '--'),  # 净值日期
-            'dwjz': str(nav_data.get('DWJZ', '--')),  # 单位净值
-            'ljjz': str(nav_data.get('LJJZ', '--')),  # 累计净值
-            'jzrq': nav_data.get('FSRQ', '--'),  # 净值日期
-            'sgzt': nav_data.get('SGZT', '--'),  # 申购状态
-            'shzt': nav_data.get('SHZT', '--'),  # 赎回状态
-            'source': 'eastmoney',
-            'update_time': nav_data.get('FSRQ', '--'),  # 数据更新时间
-            'has_estimate': estimated_change is not None,  # 是否有估算数据
-            'stock_ratio': estimate.get('stock_ratio', 0),  # 股票占净比
-            'top_stocks': estimate.get('stocks', []),  # 重仓股（最多10只）
-            'sectors': estimate.get('sectors', [])[:6],  # 关联板块涨跌幅
-            'performance': estimate.get('performance', {}),  # 收益率数据
-            'nav_trend': estimate.get('nav_trend'),  # 净值走势
-            'fund_managers': estimate.get('managers', []),  # 基金经理
-            'asset_allocation': estimate.get('asset_allocation'),  # 资产配置
+            'name': name,
+            'type': meta.get('type') or '',
+            'gsz': _fmt_nav(fast.get('estimated_nav')),
+            'gszzl': _fmt_num(fast.get('estimated_change')),
+            'jzzzl': _fmt_num(fast.get('nav_change')),
+            'gztime': fast.get('estimate_time') or '--',
+            'dwjz': _fmt_nav(fast.get('nav')),
+            'ljjz': _fmt_nav(nav.get('LJJZ')),
+            'jzrq': fast.get('nav_date') or nav.get('FSRQ') or '--',
+            'sgzt': nav.get('SGZT') or '--',
+            'shzt': nav.get('SHZT') or '--',
+            'source': 'tiantian',
+            'update_time': fast.get('estimate_time') or '--',
+            'has_estimate': True,
+            'has_realtime': bool(fast.get('has_realtime', True)),
+            'estimated_change': fast.get('estimated_change'),
         }
 
-        return result
+    return {
+        'code': code,
+        'name': name,
+        'type': meta.get('type') or '',
+        'gsz': _fmt_nav(nav.get('DWJZ')),
+        'gszzl': _fmt_num(nav.get('JZZZL')),
+        'jzzzl': _fmt_num(nav.get('JZZZL')),
+        'gztime': nav.get('FSRQ') or '--',
+        'dwjz': _fmt_nav(nav.get('DWJZ')),
+        'ljjz': _fmt_nav(nav.get('LJJZ')),
+        'jzrq': nav.get('FSRQ') or '--',
+        'sgzt': nav.get('SGZT') or '--',
+        'shzt': nav.get('SHZT') or '--',
+        'source': 'eastmoney',
+        'update_time': nav.get('FSRQ') or '--',
+        'has_estimate': False,
+        'has_realtime': False,
+        'estimated_change': None,
+    }
 
-    except requests.exceptions.Timeout:
-        raise Exception('请求超时，天天基金网响应较慢，请稍候重试')
-    except requests.exceptions.ConnectionError:
-        raise Exception('无法连接到数据源，请检查网络')
-    except requests.exceptions.RequestException:
-        raise Exception('获取数据失败，请检查基金代码是否正确')
-    except json.JSONDecodeError:
-        raise Exception('数据解析失败，请稍后重试')
-    except Exception:
-        raise Exception('获取基金数据失败，请稍后重试')
+
+def get_fund_data(code):
+    """获取基金基础数据（不做重仓股等重型抓取）。"""
+    _validate_code(code)
+
+    try:
+        meta = get_fund_meta(code)
+    except Exception as exc:
+        logger.warning(f"获取基金 {code} 基础信息异常：{exc}")
+        meta = {}
+
+    fast = get_fast_valuation(code)
+
+    nav = None
+    nav_error = None
+    try:
+        nav = get_fund_nav(code)
+    except (FundNotFoundError, UpstreamError) as exc:
+        nav_error = exc
+
+    # 净值缺失时，只有盘中估值可以独立支撑一条有效记录；否则如实报错，
+    # 避免把搜索接口命中的股票当成基金返回全空数据。
+    if not nav and not (fast and fast.get('has_estimate')):
+        if nav_error is not None:
+            raise nav_error
+        raise FundNotFoundError(f'未找到基金 {code}，请检查代码是否正确')
+
+    return _build_basic_payload(code, meta, fast, nav)
+
+
+def get_fund_detail(code):
+    """获取基金详情（重仓股、板块、阶段收益等），结果缓存 5 分钟。"""
+    cached = DETAIL_CACHE.get(code)
+    if cached is not None:
+        return cached
+
+    payload = get_fund_data(code)
+
+    try:
+        estimate = get_fund_stock_estimate(code)
+    except Exception as exc:
+        logger.warning(f"获取基金 {code} 详情失败：{exc}")
+        estimate = {}
+
+    payload.update({
+        'stock_ratio': estimate.get('stock_ratio', 0),
+        'top_stocks': (estimate.get('stocks') or [])[:10],
+        'sectors': (estimate.get('sectors') or [])[:6],
+        'performance': estimate.get('performance') or {},
+        'nav_trend': estimate.get('nav_trend'),
+        'fund_managers': estimate.get('managers') or [],
+        'asset_allocation': estimate.get('asset_allocation'),
+    })
+
+    if not payload.get('has_estimate'):
+        change = estimate.get('estimated_change')
+        latest_nav = _to_float(payload.get('dwjz'))
+        if change is not None and latest_nav:
+            payload['gsz'] = _fmt_nav(latest_nav * (1 + change / 100))
+            payload['gszzl'] = _fmt_num(change)
+            payload['estimated_change'] = change
+            payload['has_estimate'] = True
+            payload['source'] = 'eastmoney_estimate'
+            payload['update_time'] = datetime.now(SHANGHAI_TZ).strftime('%Y-%m-%d %H:%M')
+            payload['gztime'] = payload['update_time']
+
+    DETAIL_CACHE.set(code, payload, DETAIL_CACHE_TTL)
+    return payload
+
+
+def _run_fund_route(code, loader):
+    if not isinstance(code, str) or len(code) != 6 or not code.isdigit():
+        return _api_error('无效的基金代码，请输入 6 位数字', 400)
+    try:
+        return jsonify({'success': True, 'data': loader(code)})
+    except ValueError as exc:
+        return _api_error(str(exc), 400)
+    except FundNotFoundError as exc:
+        return _api_error(str(exc), 404)
+    except UpstreamError as exc:
+        logger.warning(f"上游数据源异常：{exc}")
+        return _api_error(str(exc), 502)
+    except Exception as exc:
+        logger.error(f"获取基金 {code} 数据异常：{str(exc)}\n{traceback.format_exc()}")
+        return _api_error('获取数据失败，请稍后重试', 500)
 
 
 @app.route('/api/fund/<code>', methods=['GET'])
 @app.route('/guzhi/api/fund/<code>', methods=['GET'])
 def get_single_fund(code):
-    """
-    获取单个基金数据
-    
-    Args:
-        code (str): 6 位基金代码
-        
-    Returns:
-        JSON: 基金数据
-    """
-    # 验证基金代码格式
-    if not code or not code.isdigit() or len(code) != 6:
-        return jsonify({
-            'success': False,
-            'error': '无效的基金代码，请输入 6 位数字'
-        }), 400
-    
-    try:
-        fund_data = get_fund_data(code)
-        
-        if fund_data:
-            return jsonify({
-                'success': True,
-                'data': fund_data
-            })
-        else:
-            return jsonify({
-                'success': False,
-                'error': f'未找到基金 {code}，请检查代码是否正确'
-            }), 404
-            
-    except Exception as e:
-        logger.error(f"获取基金 {code} 数据异常：{str(e)}\n{traceback.format_exc()}")
-        return jsonify({
-            'success': False,
-            'error': '获取数据失败，请稍后重试'
-        }), 500
+    """获取基金基础数据（净值与盘中估值）。"""
+    return _run_fund_route(code, get_fund_data)
+
+
+@app.route('/api/fund/<code>/detail', methods=['GET'])
+@app.route('/guzhi/api/fund/<code>/detail', methods=['GET'])
+def get_fund_detail_route(code):
+    """获取基金详情（重仓股、板块、阶段收益、净值走势）。"""
+    return _run_fund_route(code, get_fund_detail)
 
 
 @app.route('/api/funds/batch', methods=['POST', 'OPTIONS'])
@@ -768,13 +1137,11 @@ def get_batch_funds():
             }), 400
 
         # 验证所有基金代码格式
-        invalid_codes = [code for code in codes if not code.isdigit() or len(code) != 6]
+        invalid_codes = [c for c in codes if not isinstance(c, str) or len(c) != 6 or not c.isdigit()]
         if invalid_codes:
-            return jsonify({
-                'success': False,
-                'error': f'以下基金代码格式不正确：{", ".join(invalid_codes)}'
-            }), 400
-        
+            return _api_error(f'以下基金代码格式不正确：{", ".join(map(str, invalid_codes))}', 400)
+
+        codes = list(dict.fromkeys(codes))
         logger.info(f"批量获取 {len(codes)} 只基金的数据...")
         
         # 使用线程池并发请求，提高性能
@@ -821,243 +1188,52 @@ def get_batch_funds():
 @app.route('/api/funds/fast', methods=['POST', 'OPTIONS'])
 @app.route('/guzhi/api/funds/fast', methods=['POST', 'OPTIONS'])
 def get_fast_batch_funds():
-    """
-    快速批量获取基金数据（使用天天基金批量估值接口）
-
-    Request Body:
-        {
-            "codes": ["000001", "000002", ...]
-        }
-
-    Returns:
-        JSON: 基金基础数据列表（净值、涨跌幅等）
-    """
-    # 处理 OPTIONS 预检请求
+    """批量获取盘中估值（最多 50 只）。"""
     if request.method == 'OPTIONS':
         return '', 204
 
-    try:
-        data = request.get_json(silent=True) or {}
-        codes = data.get('codes', [])
+    data = request.get_json(silent=True) or {}
+    codes = data.get('codes', [])
 
-        if not codes or not isinstance(codes, list):
-            return jsonify({
-                'success': False,
-                'error': '请提供基金代码列表'
-            }), 400
+    if not codes or not isinstance(codes, list):
+        return _api_error('请提供基金代码列表', 400)
+    if len(codes) > FAST_BATCH_SIZE:
+        return _api_error(f'单次最多查询 {FAST_BATCH_SIZE} 只基金', 400)
 
-        # 限制批量请求数量
-        if len(codes) > 50:
-            return jsonify({
-                'success': False,
-                'error': '单次最多查询 50 只基金'
-            }), 400
+    invalid_codes = [c for c in codes if not isinstance(c, str) or len(c) != 6 or not c.isdigit()]
+    if invalid_codes:
+        return _api_error(f'以下基金代码格式不正确：{", ".join(map(str, invalid_codes))}', 400)
 
-        # 验证所有基金代码格式
-        invalid_codes = [code for code in codes if not code.isdigit() or len(code) != 6]
-        if invalid_codes:
-            return jsonify({
-                'success': False,
-                'error': f'以下基金代码格式不正确：{", ".join(invalid_codes)}'
-            }), 400
+    unique_codes = list(dict.fromkeys(codes))
+    records = get_fast_valuations(unique_codes)
+    results = [_valuation_payload(records[c]) for c in unique_codes if c in records]
+    missing = [c for c in unique_codes if c not in records]
 
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://fund.eastmoney.com/'
-        }
-
-        # 使用天天基金批量估值接口
-        codes_str = ','.join(codes)
-        url = f'https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast?FCODES={codes_str}&FIELDS=FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE,NAVCHGRT'
-
-        resp = requests.get(url, headers=headers, timeout=API_TIMEOUT)
-        data = resp.json()
-
-        results = []
-        if data.get('success') and data.get('data'):
-            for fund in data['data']:
-                fund_code = fund.get('FCODE', '')
-                fund_data = {
-                    'code': fund_code,
-                    'name': fund.get('SHORTNAME', ''),
-                    'dwjz': str(fund.get('NAV', '--')),
-                    'gszzl': str(fund.get('GSZZL', 0)) if fund.get('GSZZL') is not None else '0',
-                    'jzzzl': str(fund.get('NAVCHGRT', 0)) if fund.get('NAVCHGRT') is not None else '0',
-                    'gsz': str(fund.get('GSZ', '--')) if fund.get('GSZ') is not None else '--',
-                    'gztime': fund.get('GZTIME', '--'),
-                    'jzrq': fund.get('PDATE', '--'),
-                    'source': 'tiantian'
-                }
-                results.append(fund_data)
-
-        return jsonify({
-            'success': len(results) > 0,
-            'data': results,
-            'message': f'成功获取 {len(results)} 只基金数据'
-        })
-
-    except requests.exceptions.Timeout:
-        return jsonify({
-            'success': False,
-            'error': '请求超时，请稍后重试'
-        }), 500
-    except Exception as e:
-        logger.error(f"快速批量获取基金数据异常：{str(e)}\n{traceback.format_exc()}")
-        return jsonify({
-            'success': False,
-            'error': '获取数据失败，请稍后重试'
-        }), 500
+    return jsonify({
+        'success': bool(results),
+        'data': results,
+        'failed_codes': missing or None,
+        'message': f'成功获取 {len(results)} 只基金数据',
+    })
 
 
 @app.route('/api/trading-status', methods=['GET'])
 @app.route('/guzhi/api/trading-status', methods=['GET'])
 def get_trading_status():
-    """
-    获取当前交易状态
-
-    Returns:
-        JSON: 交易状态信息
-    """
+    """获取上海时区下的 A 股交易状态。"""
     try:
-        now = datetime.now()
-        current_date = now.date()
-        current_time = now.time()
-        weekday = now.weekday()  # 0=周一, 6=周日
-
-        # 2024-2025年节假日（可后续更新）
-        holidays_2025 = [
-            # 元旦
-            date(2025, 1, 1),
-            # 春节
-            date(2025, 1, 28), date(2025, 1, 29), date(2025, 1, 30),
-            date(2025, 1, 31), date(2025, 2, 1), date(2025, 2, 2), date(2025, 2, 3),
-            # 清明节
-            date(2025, 4, 4), date(2025, 4, 5), date(2025, 4, 6),
-            # 劳动节
-            date(2025, 5, 1), date(2025, 5, 2), date(2025, 5, 3),
-            date(2025, 5, 4), date(2025, 5, 5),
-            # 端午节
-            date(2025, 5, 31), date(2025, 6, 1), date(2025, 6, 2),
-            # 中秋节+国庆节
-            date(2025, 10, 1), date(2025, 10, 2), date(2025, 10, 3),
-            date(2025, 10, 4), date(2025, 10, 5), date(2025, 10, 6), date(2025, 10, 7),
-        ]
-
-        holidays_2026 = [
-            # 元旦
-            date(2026, 1, 1), date(2026, 1, 2), date(2026, 1, 3),
-            # 春节
-            date(2026, 2, 17), date(2026, 2, 18), date(2026, 2, 19),
-            date(2026, 2, 20), date(2026, 2, 21), date(2026, 2, 22), date(2026, 2, 23),
-            # 清明节
-            date(2026, 4, 5), date(2026, 4, 6), date(2026, 4, 7),
-            # 劳动节
-            date(2026, 5, 1), date(2026, 5, 2), date(2026, 5, 3),
-            # 端午节
-            date(2026, 6, 19), date(2026, 6, 20), date(2026, 6, 21),
-            # 中秋节
-            date(2026, 9, 25), date(2026, 9, 26), date(2026, 9, 27),
-            # 国庆节
-            date(2026, 10, 1), date(2026, 10, 2), date(2026, 10, 3),
-            date(2026, 10, 4), date(2026, 10, 5), date(2026, 10, 6), date(2026, 10, 7),
-        ]
-
-        holidays = holidays_2025 + holidays_2026
-
-        # 判断是否为节假日
-        is_holiday = current_date in holidays
-
-        # 判断是否为周末
-        is_weekend = weekday >= 5
-
-        # 判断是否为交易日
-        is_trading_day = not is_holiday and not is_weekend
-
-        # 判断当前时段
-        hour = current_time.hour
-        minute = current_time.minute
-        time_value = hour * 100 + minute
-
-        # A股交易时段：9:30-11:30, 13:00-15:00
-        morning_start = 930
-        morning_end = 1130
-        afternoon_start = 1300
-        afternoon_end = 1500
-
-        is_morning_trading = morning_start <= time_value <= morning_end
-        is_afternoon_trading = afternoon_start <= time_value <= afternoon_end
-        is_trading_time = is_morning_trading or is_afternoon_trading
-
-        # 综合判断：是否正在交易
-        is_trading = is_trading_day and is_trading_time
-
-        # 计算下次开盘时间
-        next_open = None
-        if not is_trading:
-            if is_trading_day:
-                # 今天是交易日但不在交易时段
-                if time_value < morning_start:
-                    next_open = f'{current_date} 09:30'
-                elif morning_end < time_value < afternoon_start:
-                    next_open = f'{current_date} 13:00'
-                else:
-                    # 今天的交易已结束，找下一个交易日
-                    next_date = current_date + timedelta(days=1)
-                    while next_date.weekday() >= 5 or next_date in holidays:
-                        next_date += timedelta(days=1)
-                    next_open = f'{next_date} 09:30'
-            else:
-                # 今天不是交易日，找下一个交易日
-                next_date = current_date + timedelta(days=1)
-                while next_date.weekday() >= 5 or next_date in holidays:
-                    next_date += timedelta(days=1)
-                next_open = f'{next_date} 09:30'
-
-        # 确定市场状态描述
-        if is_trading:
-            status = 'trading'
-            status_text = '交易中'
-        elif is_trading_day and not is_trading_time:
-            status = 'closed_today'
-            status_text = '今日休市（非交易时段）'
-        elif is_holiday:
-            status = 'holiday'
-            status_text = '节假日休市'
-        elif is_weekend:
-            status = 'weekend'
-            status_text = '周末休市'
-        else:
-            status = 'closed'
-            status_text = '休市'
-
-        return jsonify({
-            'success': True,
-            'status': status,
-            'status_text': status_text,
-            'is_trading': is_trading,
-            'is_trading_day': is_trading_day,
-            'is_holiday': is_holiday,
-            'is_weekend': is_weekend,
-            'current_time': now.strftime('%Y-%m-%d %H:%M:%S'),
-            'next_open': next_open,
-            'suggested_refresh_interval': 60000 if is_trading else 300000
-        })
-
-    except Exception as e:
-        logger.error(f"获取交易状态失败：{e}\n{traceback.format_exc()}")
+        status = _market_status()
+        return jsonify({'success': True, **status})
+    except Exception as exc:
+        logger.error(f"获取交易状态失败：{exc}\n{traceback.format_exc()}")
         return jsonify({
             'success': False,
-            'error': str(e),
+            'error': '无法获取交易状态',
             'status': 'unknown',
             'status_text': '无法获取交易状态',
             'is_trading': False,
-            'is_trading_day': False,
-            'is_holiday': False,
-            'is_weekend': False,
-            'current_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
             'next_open': None,
-            'suggested_refresh_interval': 300000
-        })
+        }), 500
 
 
 @app.route('/api/health', methods=['GET'])
@@ -1072,7 +1248,7 @@ def health_check():
     return jsonify({
         'status': 'ok',
         'message': '基金估值 API 服务运行正常',
-        'timestamp': datetime.now().isoformat()
+        'timestamp': datetime.now(SHANGHAI_TZ).isoformat(),
     })
 
 
@@ -1085,24 +1261,23 @@ def index():
     return jsonify({
         'message': '欢迎使用基金估值 API 服务',
         'endpoints': {
-            'GET /api/fund/<code>': '获取单个基金数据',
-            'GET /guzhi/api/fund/<code>': '获取单个基金数据 (带前缀)',
-            'POST /api/funds/batch': '批量获取基金数据',
-            'POST /guzhi/api/funds/batch': '批量获取基金数据 (带前缀)',
+            'GET /api/fund/<code>': '基金基础数据',
+            'GET /api/fund/<code>/detail': '基金详情',
+            'POST /api/funds/fast': '批量盘中估值',
+            'POST /api/funds/batch': '批量基金基础数据',
+            'GET /api/trading-status': '交易状态',
             'GET /api/health': '健康检查',
-            'GET /guzhi/api/health': '健康检查 (带前缀)'
         }
     })
 
 
 if __name__ == '__main__':
     print("=" * 60)
-    print("    基金估值 API 服务")
+    print("    Fund Valuation API")
     print("=" * 60)
-    print("🚀 服务启动中...")
-    print("📡 监听地址：http://localhost:5000")
-    print("📚 API 文档：http://localhost:5000")
-    print("💡 示例：http://localhost:5000/api/fund/000001")
+    print("Server : http://localhost:5000")
+    print("Health : http://localhost:5000/api/health")
+    print("Example: http://localhost:5000/api/fund/000001")
     print("=" * 60)
-    
+
     app.run(host='0.0.0.0', port=5000, debug=False, threaded=True)

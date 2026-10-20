@@ -7,6 +7,9 @@ venv/
 # Local deployment artifact (contains source snapshot and pycache)
 /guzhi
 
+# Runtime
+run/
+
 # Logs / OS / editor
 *.log
 .DS_Store

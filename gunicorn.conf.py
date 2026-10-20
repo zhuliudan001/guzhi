@@ -1,23 +1,21 @@
 # Gunicorn 配置文件
-# 绑定地址
 bind = "127.0.0.1:5000"
 
-# worker 进程数（建议 CPU 核心数 * 2 + 1）
+# gthread 适合以网络 I/O 为主的抓取型服务
 workers = 2
+threads = 8
+worker_class = "gthread"
 
-# worker 模式
-worker_class = "sync"
+# 上游抓取较慢时留出余量
+timeout = 60
+graceful_timeout = 30
+keepalive = 5
 
-# 超时时间
-timeout = 30
+pidfile = "run/gunicorn.pid"
 
-# 日志
 accesslog = "-"
 errorlog = "-"
 loglevel = "info"
 
-# 进程名
 proc_name = "fund_api"
-
-# 预加载应用
 preload_app = True
