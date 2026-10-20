@@ -1,0 +1,13 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Local deployment artifact (contains source snapshot and pycache)
+/guzhi
+
+# Logs / OS / editor
+*.log
+.DS_Store
+Thumbs.db
