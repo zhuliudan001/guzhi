@@ -34,7 +34,7 @@ Gunicorn 使用 `gthread`（2 workers × 8 threads），监听 `127.0.0.1:5000`�
 
 - **后端**：`fund_api.py` — Flask 应用，所有上游请求由服务端发起，带重试、超时、TTL 缓存和错误映射。
 - **前端**：`index.html` + `app.js` + `app-utils.js` + `style.css`，原生 JS SPA，无构建步骤。
-- **共享逻辑**：`app-utils.js` 以 UMD 方式导出收益计算、汇总、格式化和转义函数，供浏览器和 Node 测试共用。
+- **共享逻辑**：`app-utils.js` 以 UMD 方式导出收益计算、汇总、格式化、转义和备份校验/合并函数，供浏览器和 Node 测试共用。
 - **API 地址**：`app.js` 自动解析——本地 `localhost` / `file://` 使用 `http://localhost:5000/api`；路径以 `/guzhi` 开头时使用 `/guzhi/api`；其余使用同源 `/api`。不需要手动改代码。
 - **路由前缀**：所有 API 同时支持 `/api/` 和 `/guzhi/api/` 两种路径。
 - **数据流**：搜索先取基础数据，再异步加载详情；自选列表使用批量快速估值接口，缺失估值时降级到最新披露净值。
@@ -70,6 +70,17 @@ Gunicorn 使用 `gthread`（2 workers × 8 threads），监听 `127.0.0.1:5000`�
 - **CORS**：允许生产域名 `https://guzhi.itect.me` 和任意 `localhost` / `127.0.0.1` 端口；更换生产域名时需更新 `ALLOWED_ORIGINS`。
 - **交易状态**：按上海时区和内置 A 股节假日表判断；休市时自动刷新间隔为 5 分钟，交易中为 1 分钟。
 
+## 数据备份
+
+- 入口：自选基金卡片头部的“数据”按钮，空状态中的“从备份恢复”。备份完全在浏览器本地完成，不上传服务器。
+- 备份格式：`{ app: "guzhi", version: 1, exportedAt, data: { favorites, searchHistory, autoRefreshEnabled } }`，导出文件名 `guzhi-backup-YYYY-MM-DD.json`。
+- 校验：仅接受 `app === "guzhi"` 且 `version === 1`；基金代码必须为 6 位数字，名称非空且不超过 100 字符，持仓为非负数；最多 200 只自选、10 条搜索记录；文件最大 1MB。无效记录忽略并在预览中计数，不会中断整份导入。
+- 去重：自选同一代码以最后一条为准，搜索历史以第一条为准。
+- 合并导入：保留本机自选顺序，同代码用备份中的名称和持仓覆盖，备份独有的基金追加到末尾；保留本机自动刷新设置。
+- 覆盖导入：用备份替换自选和搜索历史，并采用备份中的自动刷新设置。
+- 导入后必须调用 `renderFavorites(true)` 强制重建列表，否则已有行时新导入的基金不会出现在 DOM 中。
+- 备份文件包含持仓金额，属于隐私数据；导出后由用户自行保管。
+
 ## 文件结构
 
 ```
@@ -94,7 +105,8 @@ node --test tests/app-utils.test.js           # 前端共享逻辑
 
 ## 注意事项
 
-- 自选基金、持仓金额和搜索历史保存在浏览器 localStorage。
+- 自选基金、持仓金额和搜索历史保存在浏览器 localStorage（`fundFavorites` / `searchHistory` / `autoRefreshEnabled`）。
+- 换设备或清理浏览器前，先通过“数据 → 导出备份”保存 JSON 文件；备份包含持仓金额，请勿公开分享。
 - 所有动态内容在插入 HTML 前必须经过 `escapeHtml` / `escapeAttr`。
 - 盘中估值是参考值，实际净值以基金公司公布为准；没有估值的基金不展示伪造的收益。
 - `guzhi` 压缩包为本地备份，已被 `.gitignore` 忽略，不要提交或删除。

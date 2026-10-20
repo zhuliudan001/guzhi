@@ -16,11 +16,16 @@ const {
     formatChange,
     escapeHtml,
     escapeAttr,
+    createBackup,
+    parseBackup,
+    mergeFavorites,
+    mergeSearchHistory,
 } = AppUtils;
 const TRADING_REFRESH_INTERVAL = 60000;  // 交易中：1分钟
 const CLOSED_REFRESH_INTERVAL = 300000; // 休市时：5分钟
 const MAX_SEARCH_HISTORY = 10;
 const MAX_RETRY_COUNT = 2;
+const MAX_BACKUP_FILE_SIZE = 1024 * 1024;
 let refreshTimer = null;
 let refreshTimerInterval = null;
 let currentTradingStatus = null;
@@ -106,7 +111,10 @@ const ICONS = {
     'exclamation-circle': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>',
     'exclamation-triangle': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>',
     'grip-vertical': '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="9" cy="6" r="1.5"/><circle cx="15" cy="6" r="1.5"/><circle cx="9" cy="12" r="1.5"/><circle cx="15" cy="12" r="1.5"/><circle cx="9" cy="18" r="1.5"/><circle cx="15" cy="18" r="1.5"/></svg>',
-    'xmark': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>'
+    'xmark': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>',
+    'database': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>',
+    'download': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>',
+    'upload': '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>'
 };
 
 function icon(name) {
@@ -977,7 +985,7 @@ function renderSummary(fundList) {
     `;
 }
 
-function renderFavorites() {
+function renderFavorites(force = false) {
     const favs = getStorage('fundFavorites', []);
     const tbody = document.getElementById('favoritesList');
     const cards = document.getElementById('favoritesCardList');
@@ -993,7 +1001,7 @@ function renderFavorites() {
     empty.style.display = 'none';
 
     // 检查是否已有数据（判断是否首次加载）
-    const hasExistingData = tbody.querySelector('tr[data-code]') && !tbody.querySelector('.skeleton');
+    const hasExistingData = !force && tbody.querySelector('tr[data-code]') && !tbody.querySelector('.skeleton');
 
     // 首次加载时显示骨架屏
     if (!hasExistingData) {
@@ -1330,16 +1338,16 @@ async function sortFavorites() {
     } catch { showToast('排序失败', 'error'); }
 }
 
-function toggleAutoRefresh(enable) {
+function toggleAutoRefresh(enable, silent = false) {
     if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null; }
     refreshTimerInterval = null;
     if (enable) {
         startAutoRefresh();
         setStorage('autoRefreshEnabled', true);
-        showToast('自动刷新已开启', 'success');
+        if (!silent) showToast('自动刷新已开启', 'success');
     } else {
         setStorage('autoRefreshEnabled', false);
-        showToast('自动刷新已关闭', 'info');
+        if (!silent) showToast('自动刷新已关闭', 'info');
     }
 }
 
@@ -1619,6 +1627,182 @@ function saveOrderFromDOM() {
     setStorage('fundFavorites', reordered);
 }
 
+// ========== Data Backup ==========
+function getBackupState() {
+    const favorites = getStorage('fundFavorites', []);
+    const searchHistory = getStorage('searchHistory', []);
+    return {
+        favorites: Array.isArray(favorites) ? favorites : [],
+        searchHistory: Array.isArray(searchHistory) ? searchHistory : [],
+        autoRefreshEnabled: getStorage('autoRefreshEnabled', false) === true,
+    };
+}
+
+function formatBackupTime(value) {
+    if (!value) return '未知时间';
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return '未知时间';
+    return date.toLocaleString('zh-CN', { hour12: false });
+}
+
+function downloadBackup() {
+    const backup = createBackup(getBackupState());
+    const blob = new Blob([JSON.stringify(backup, null, 2)], { type: 'application/json;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const date = new Date();
+    const pad = (value) => String(value).padStart(2, '0');
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = `guzhi-backup-${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}.json`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+function applyImportedData(data, mode) {
+    const local = getBackupState();
+    const merge = mode === 'merge';
+    const favorites = merge ? mergeFavorites(local.favorites, data.favorites) : data.favorites;
+    const searchHistory = merge ? mergeSearchHistory(local.searchHistory, data.searchHistory) : data.searchHistory;
+    const autoRefreshEnabled = merge ? local.autoRefreshEnabled : data.autoRefreshEnabled;
+
+    setStorage('fundFavorites', favorites);
+    setStorage('searchHistory', searchHistory);
+
+    const switchEl = document.getElementById('autoRefreshSwitch');
+    if (switchEl) switchEl.checked = autoRefreshEnabled;
+    toggleAutoRefresh(autoRefreshEnabled, true);
+
+    renderHistory();
+    renderFavorites(true);
+
+    return { favorites: favorites.length, searchHistory: searchHistory.length };
+}
+
+function openBackupDialog(options = {}) {
+    const overlay = document.createElement('div');
+    overlay.className = 'dialog-backdrop';
+    overlay.innerHTML = `
+        <div class="dialog backup-dialog" role="dialog" aria-modal="true" aria-labelledby="backupDialogTitle">
+            <div class="dialog-header">
+                <div class="dialog-icon info">${icon('database')}</div>
+                <h3 class="dialog-title" id="backupDialogTitle">数据备份</h3>
+                <p class="dialog-desc">导出自选、持仓金额、搜索历史和自动刷新设置</p>
+                <button class="dialog-close" id="closeBackupTop" type="button" aria-label="关闭" title="关闭">${icon('xmark')}</button>
+            </div>
+            <div class="dialog-body" id="backupDialogBody"></div>
+            <div class="dialog-footer" id="backupDialogFooter"></div>
+        </div>
+    `;
+    document.body.appendChild(overlay);
+    document.body.style.overflow = 'hidden';
+
+    const body = overlay.querySelector('#backupDialogBody');
+    const footer = overlay.querySelector('#backupDialogFooter');
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.id = 'backupFileInput';
+    fileInput.accept = '.json,application/json';
+    fileInput.style.display = 'none';
+    overlay.appendChild(fileInput);
+
+    let parsedBackup = null;
+
+    const onKeydown = (event) => {
+        if (event.key === 'Escape') close();
+    };
+
+    const close = () => {
+        document.removeEventListener('keydown', onKeydown);
+        overlay.remove();
+        document.body.style.overflow = '';
+    };
+
+    const finishImport = (mode) => {
+        if (!parsedBackup) return;
+        const result = applyImportedData(parsedBackup, mode);
+        close();
+        showToast(
+            `${mode === 'merge' ? '已合并导入' : '已覆盖导入'}：${result.favorites} 只基金、${result.searchHistory} 条搜索记录`,
+            'success'
+        );
+    };
+
+    const renderHome = (errorMessage = '') => {
+        parsedBackup = null;
+        const state = getBackupState();
+        body.innerHTML = `
+            <div class="backup-actions">
+                <button type="button" class="btn btn-primary" id="exportBackupBtn">${icon('download')}导出备份</button>
+                <button type="button" class="btn btn-secondary" id="importBackupBtn">${icon('upload')}导入备份</button>
+            </div>
+            <p class="backup-hint">
+                当前数据：${state.favorites.length} 只自选基金 · ${state.searchHistory.length} 条搜索记录。<br>
+                备份文件只保存在本机，包含持仓金额，请妥善保管。
+            </p>
+            ${errorMessage ? `<p class="backup-error">${escapeHtml(errorMessage)}</p>` : ''}
+        `;
+        footer.innerHTML = '<button type="button" class="btn btn-secondary" id="closeBackupDlg">关闭</button>';
+        body.querySelector('#exportBackupBtn').onclick = () => {
+            downloadBackup();
+            showToast('备份已导出', 'success');
+        };
+        body.querySelector('#importBackupBtn').onclick = () => fileInput.click();
+        footer.querySelector('#closeBackupDlg').onclick = close;
+        body.querySelector('#exportBackupBtn').focus();
+    };
+
+    const renderPreview = (backup) => {
+        parsedBackup = backup;
+        const ignored = backup.ignored.favorites + backup.ignored.searchHistory;
+        body.innerHTML = `
+            <div class="backup-preview">
+                <div class="backup-preview-title">备份文件校验通过</div>
+                <div class="backup-preview-meta">
+                    备份时间：${escapeHtml(formatBackupTime(backup.exportedAt))}<br>
+                    自选基金：${backup.favorites.length} 只 · 搜索记录：${backup.searchHistory.length} 条<br>
+                    自动刷新：${backup.autoRefreshEnabled ? '开启' : '关闭'}
+                </div>
+                ${ignored ? `<p class="backup-warning">已忽略 ${ignored} 条无效记录</p>` : ''}
+            </div>
+            <p class="backup-hint">合并会保留本机独有的基金，同代码使用备份中的持仓；覆盖会用备份完整替换本机自选和搜索历史。</p>
+            <button type="button" class="backup-link" id="backupReselect">重新选择文件</button>
+        `;
+        footer.innerHTML = `
+            <button type="button" class="btn btn-primary" id="backupMerge">合并导入</button>
+            <button type="button" class="btn btn-danger-outline" id="backupReplace">覆盖导入</button>
+        `;
+        body.querySelector('#backupReselect').onclick = () => fileInput.click();
+        footer.querySelector('#backupMerge').onclick = () => finishImport('merge');
+        footer.querySelector('#backupReplace').onclick = () => finishImport('replace');
+        footer.querySelector('#backupMerge').focus();
+    };
+
+    fileInput.addEventListener('change', async () => {
+        const file = fileInput.files && fileInput.files[0];
+        fileInput.value = '';
+        if (!file) return;
+        if (file.size > MAX_BACKUP_FILE_SIZE) {
+            renderHome('备份文件过大，最大支持 1MB');
+            return;
+        }
+        try {
+            renderPreview(parseBackup(await file.text()));
+        } catch (error) {
+            renderHome(error && error.message ? error.message : '导入失败');
+        }
+    });
+
+    overlay.addEventListener('click', (event) => {
+        if (event.target === overlay || event.target.closest('#closeBackupTop')) close();
+    });
+    document.addEventListener('keydown', onKeydown);
+
+    renderHome();
+    if (options.startImport) fileInput.click();
+}
+
 // ========== Init ==========
 function init() {
     document.getElementById('searchBtn').onclick = searchFund;
@@ -1626,6 +1810,8 @@ function init() {
     document.getElementById('clearHistoryBtn').onclick = clearSearchHistory;
     document.getElementById('refreshFavoritesBtn').onclick = () => { renderFavorites(); showToast('刷新中...', 'info'); };
     document.getElementById('sortFavoritesBtn').onclick = sortFavorites;
+    document.getElementById('backupBtn').onclick = () => openBackupDialog();
+    document.getElementById('restoreBackupBtn').onclick = () => openBackupDialog({ startImport: true });
     document.getElementById('autoRefreshSwitch').onchange = (e) => toggleAutoRefresh(e.target.checked);
 
     // 检查交易状态

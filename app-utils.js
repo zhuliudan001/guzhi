@@ -89,6 +89,145 @@
             .replace(/'/g, '&#39;');
     }
 
+    const BACKUP_APP = 'guzhi';
+    const BACKUP_VERSION = 1;
+    const MAX_BACKUP_FAVORITES = 200;
+    const MAX_BACKUP_HISTORY = 10;
+    const MAX_FUND_NAME_LENGTH = 100;
+
+    function backupError(code, message) {
+        const error = new Error(message);
+        error.code = code;
+        return error;
+    }
+
+    function normalizeCode(value) {
+        const code = String(value === null || value === undefined ? '' : value).trim();
+        return /^\d{6}$/.test(code) ? code : null;
+    }
+
+    function normalizeName(value) {
+        if (typeof value !== 'string') return null;
+        const name = value.trim().replace(/\s+/g, ' ');
+        if (!name || name.length > MAX_FUND_NAME_LENGTH) return null;
+        return name;
+    }
+
+    function normalizePosition(value) {
+        const position = toNumber(value);
+        return position !== null && position >= 0 ? position : 0;
+    }
+
+    function normalizeFavorites(list) {
+        if (!Array.isArray(list)) return { items: [], ignored: 0 };
+        const byCode = new Map();
+        let ignored = 0;
+        list.forEach((item) => {
+            if (!item || typeof item !== 'object') { ignored += 1; return; }
+            const code = normalizeCode(item.code);
+            const name = normalizeName(item.name);
+            if (!code || !name) { ignored += 1; return; }
+            byCode.set(code, { code, name, position: normalizePosition(item.position) });
+        });
+        const items = Array.from(byCode.values());
+        const dropped = Math.max(0, items.length - MAX_BACKUP_FAVORITES);
+        return { items: items.slice(0, MAX_BACKUP_FAVORITES), ignored: ignored + dropped };
+    }
+
+    function normalizeSearchHistory(list) {
+        if (!Array.isArray(list)) return { items: [], ignored: 0 };
+        const byCode = new Map();
+        let ignored = 0;
+        list.forEach((item) => {
+            if (!item || typeof item !== 'object') { ignored += 1; return; }
+            const code = normalizeCode(item.code);
+            const name = normalizeName(item.name);
+            if (!code || !name) { ignored += 1; return; }
+            if (!byCode.has(code)) byCode.set(code, { code, name });
+        });
+        const items = Array.from(byCode.values());
+        const dropped = Math.max(0, items.length - MAX_BACKUP_HISTORY);
+        return { items: items.slice(0, MAX_BACKUP_HISTORY), ignored: ignored + dropped };
+    }
+
+    function createBackup(state, exportedAt) {
+        const source = state && typeof state === 'object' ? state : {};
+        const favorites = normalizeFavorites(source.favorites);
+        const history = normalizeSearchHistory(source.searchHistory);
+        const timestamp = exportedAt instanceof Date && !Number.isNaN(exportedAt.getTime())
+            ? exportedAt.toISOString()
+            : (typeof exportedAt === 'string' && exportedAt ? exportedAt : new Date().toISOString());
+        return {
+            app: BACKUP_APP,
+            version: BACKUP_VERSION,
+            exportedAt: timestamp,
+            data: {
+                favorites: favorites.items,
+                searchHistory: history.items,
+                autoRefreshEnabled: source.autoRefreshEnabled === true,
+            },
+        };
+    }
+
+    function parseBackup(text) {
+        if (typeof text !== 'string' || !text.trim()) {
+            throw backupError('invalid_json', '备份文件为空');
+        }
+        let raw;
+        try {
+            raw = JSON.parse(text);
+        } catch {
+            throw backupError('invalid_json', '文件不是有效的 JSON');
+        }
+        if (!raw || typeof raw !== 'object' || Array.isArray(raw) || raw.app !== BACKUP_APP) {
+            throw backupError('invalid_backup', '不是本应用的备份文件');
+        }
+        if (raw.version !== BACKUP_VERSION) {
+            throw backupError('unsupported_version', `备份版本 ${raw.version === undefined ? '未知' : raw.version} 不受支持`);
+        }
+        if (!raw.data || typeof raw.data !== 'object' || Array.isArray(raw.data)) {
+            throw backupError('invalid_backup', '备份文件缺少数据');
+        }
+
+        const favorites = normalizeFavorites(raw.data.favorites);
+        const history = normalizeSearchHistory(raw.data.searchHistory);
+        return {
+            favorites: favorites.items,
+            searchHistory: history.items,
+            autoRefreshEnabled: raw.data.autoRefreshEnabled === true,
+            exportedAt: typeof raw.exportedAt === 'string' ? raw.exportedAt : null,
+            ignored: {
+                favorites: favorites.ignored,
+                searchHistory: history.ignored,
+            },
+        };
+    }
+
+    function mergeFavorites(localFavorites, importedFavorites) {
+        const local = normalizeFavorites(localFavorites).items;
+        const imported = normalizeFavorites(importedFavorites).items;
+        const importedByCode = new Map(imported.map((item) => [item.code, item]));
+        const merged = local.map((item) => importedByCode.get(item.code) || item);
+        const localCodes = new Set(local.map((item) => item.code));
+        imported.forEach((item) => {
+            if (!localCodes.has(item.code)) merged.push(item);
+        });
+        return merged.slice(0, MAX_BACKUP_FAVORITES);
+    }
+
+    function mergeSearchHistory(localHistory, importedHistory) {
+        const local = normalizeSearchHistory(localHistory).items;
+        const imported = normalizeSearchHistory(importedHistory).items;
+        const seen = new Set(local.map((item) => item.code));
+        const merged = local.slice();
+        imported.forEach((item) => {
+            if (seen.has(item.code)) return;
+            seen.add(item.code);
+            merged.push(item);
+        });
+        return merged.slice(0, MAX_BACKUP_HISTORY);
+    }
+
     return {
         toNumber,
         calcProfit,
@@ -96,5 +235,9 @@
         formatChange,
         escapeHtml,
         escapeAttr,
+        createBackup,
+        parseBackup,
+        mergeFavorites,
+        mergeSearchHistory,
     };
 });

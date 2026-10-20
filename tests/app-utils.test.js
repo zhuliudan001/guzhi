@@ -6,6 +6,10 @@ const {
     formatChange,
     escapeHtml,
     escapeAttr,
+    createBackup,
+    parseBackup,
+    mergeFavorites,
+    mergeSearchHistory,
 } = require('../app-utils.js');
 
 test('calcProfit uses estimated nav against latest nav', () => {
@@ -54,4 +58,153 @@ test('formatChange handles missing values', () => {
 test('escapeHtml and escapeAttr neutralize markup and quotes', () => {
     assert.equal(escapeHtml('<a>&"'), '&lt;a&gt;&amp;"');
     assert.equal(escapeAttr('a"b\'c<d>'), 'a&quot;b&#39;c&lt;d&gt;');
+});
+
+test('backup round-trips favorites, history and settings', () => {
+    const state = {
+        favorites: [
+            { code: '000001', name: '华夏成长', position: 1234.56 },
+            { code: '161725', name: '招商中证白酒', position: 0 },
+        ],
+        searchHistory: [
+            { code: '161725', name: '招商中证白酒' },
+            { code: '000001', name: '华夏成长' },
+        ],
+        autoRefreshEnabled: true,
+    };
+
+    const backup = createBackup(state, '2026-10-20T02:00:00.000Z');
+    assert.equal(backup.app, 'guzhi');
+    assert.equal(backup.version, 1);
+    assert.equal(backup.exportedAt, '2026-10-20T02:00:00.000Z');
+
+    const parsed = parseBackup(JSON.stringify(backup));
+    assert.deepEqual(parsed.favorites, state.favorites);
+    assert.deepEqual(parsed.searchHistory, state.searchHistory);
+    assert.equal(parsed.autoRefreshEnabled, true);
+    assert.equal(parsed.ignored.favorites, 0);
+    assert.equal(parsed.ignored.searchHistory, 0);
+});
+
+test('createBackup exports only known fields', () => {
+    const backup = createBackup({
+        favorites: [{ code: '000001', name: '华夏成长', position: 10, secret: 'x' }],
+        searchHistory: [{ code: '000001', name: '华夏成长', extra: true }],
+        autoRefreshEnabled: false,
+    }, '2026-10-20T02:00:00.000Z');
+
+    assert.deepEqual(Object.keys(backup.data.favorites[0]).sort(), ['code', 'name', 'position']);
+    assert.deepEqual(Object.keys(backup.data.searchHistory[0]).sort(), ['code', 'name']);
+});
+
+test('parseBackup rejects malformed, foreign and unsupported files', () => {
+    assert.throws(
+        () => parseBackup('{not json'),
+        (error) => error.code === 'invalid_json'
+    );
+    assert.throws(
+        () => parseBackup(JSON.stringify({ app: 'other', version: 1, data: {} })),
+        (error) => error.code === 'invalid_backup'
+    );
+    assert.throws(
+        () => parseBackup(JSON.stringify({ app: 'guzhi', version: 1 })),
+        (error) => error.code === 'invalid_backup'
+    );
+    assert.throws(
+        () => parseBackup(JSON.stringify({ app: 'guzhi', version: 2, data: {} })),
+        (error) => error.code === 'unsupported_version'
+    );
+});
+
+test('parseBackup sanitizes records and keeps the last duplicate', () => {
+    const parsed = parseBackup(JSON.stringify({
+        app: 'guzhi',
+        version: 1,
+        exportedAt: '2026-10-20T02:00:00.000Z',
+        data: {
+            favorites: [
+                { code: '000001', name: ' 华夏成长 ', position: '1234.5' },
+                { code: '12345', name: '坏代码', position: 1 },
+                { code: '000001', name: '华夏成长新', position: 2000 },
+                { code: '161725', name: '', position: 10 },
+                { code: '110022', name: '易方达消费', position: -5 },
+            ],
+            searchHistory: [
+                { code: '000001', name: '华夏成长' },
+                { code: 'bad', name: '坏记录' },
+                { code: '000001', name: '重复记录' },
+            ],
+            autoRefreshEnabled: 'yes',
+        },
+    }));
+
+    assert.deepEqual(parsed.favorites, [
+        { code: '000001', name: '华夏成长新', position: 2000 },
+        { code: '110022', name: '易方达消费', position: 0 },
+    ]);
+    assert.deepEqual(parsed.searchHistory, [{ code: '000001', name: '华夏成长' }]);
+    assert.equal(parsed.autoRefreshEnabled, false);
+    assert.equal(parsed.ignored.favorites, 2);
+    assert.equal(parsed.ignored.searchHistory, 1);
+});
+
+test('parseBackup caps oversized lists and reports dropped records', () => {
+    const favorites = Array.from({ length: 205 }, (_, index) => ({
+        code: String(100000 + index),
+        name: `基金${index}`,
+        position: 0,
+    }));
+    const history = Array.from({ length: 15 }, (_, index) => ({
+        code: String(200000 + index),
+        name: `历史${index}`,
+    }));
+
+    const parsed = parseBackup(JSON.stringify({
+        app: 'guzhi',
+        version: 1,
+        data: { favorites, searchHistory: history },
+    }));
+
+    assert.equal(parsed.favorites.length, 200);
+    assert.equal(parsed.ignored.favorites, 5);
+    assert.equal(parsed.searchHistory.length, 10);
+    assert.equal(parsed.ignored.searchHistory, 5);
+});
+
+test('mergeFavorites keeps local-only funds and imported positions win', () => {
+    const merged = mergeFavorites(
+        [
+            { code: '000001', name: '本地名字', position: 100 },
+            { code: '161725', name: '本地白酒', position: 0 },
+        ],
+        [
+            { code: '161725', name: '备份白酒', position: 888 },
+            { code: '110022', name: '备份消费', position: 50 },
+        ]
+    );
+
+    assert.deepEqual(merged, [
+        { code: '000001', name: '本地名字', position: 100 },
+        { code: '161725', name: '备份白酒', position: 888 },
+        { code: '110022', name: '备份消费', position: 50 },
+    ]);
+});
+
+test('mergeSearchHistory keeps local recency and appends imported codes', () => {
+    const merged = mergeSearchHistory(
+        [
+            { code: '000001', name: '本地华夏' },
+            { code: '161725', name: '本地白酒' },
+        ],
+        [
+            { code: '161725', name: '备份白酒' },
+            { code: '110022', name: '备份消费' },
+        ]
+    );
+
+    assert.deepEqual(merged, [
+        { code: '000001', name: '本地华夏' },
+        { code: '161725', name: '本地白酒' },
+        { code: '110022', name: '备份消费' },
+    ]);
 });
