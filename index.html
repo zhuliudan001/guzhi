@@ -7,172 +7,149 @@
     <title>基金估值查询 | 自选基金管理</title>
     <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <link rel="stylesheet" href="style.css">
 </head>
 
 <body>
-    <!-- 导航 -->
-    <nav class="nav">
-        <div class="nav-inner">
-            <div class="nav-brand">
-                <div class="nav-logo">
-                    <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg></span>
-                </div>
-                <span class="nav-title">基金估值</span>
-            </div>
-            <div class="nav-status" id="tradingStatus">
-                <span class="status-dot"></span>
-                <span>加载中...</span>
-            </div>
-        </div>
-    </nav>
+    <a class="skip-link" href="#main">跳到主要内容</a>
 
-    <!-- 主内容 -->
-    <main class="container">
-        <!-- 搜索 -->
-        <div class="card">
-            <div class="card-header">
-                <div class="card-header-left">
-                    <div class="card-icon"><span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span></div>
-                    <h2 class="card-title">基金搜索</h2>
-                </div>
-            </div>
-            <div class="card-body">
-                <div class="search-row">
-                    <div class="input-wrapper">
-                        <span class="svg-icon input-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>
-                        <input type="text" id="fundCode" class="input" placeholder="输入6位基金代码，如 000001" maxlength="6">
-                    </div>
-                    <button id="searchBtn" class="btn btn-primary">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>查询
-                    </button>
-                    <button id="clearHistoryBtn" class="btn btn-secondary">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/><line x1="10" y1="11" x2="10" y2="17"/><line x1="14" y1="11" x2="14" y2="17"/></svg></span>清空
-                    </button>
-                </div>
-                <div class="history-section" id="historySection" style="display: none;">
-                    <div class="history-label">
+    <header class="topbar">
+        <div class="topbar-inner">
+            <a class="brand" href="./" aria-label="基金估值首页">
+                <span class="brand-mark" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+                </span>
+                <span class="brand-name">基金估值</span>
+            </a>
+
+            <div class="search-area">
+                <form class="search-form" id="searchForm" role="search" novalidate>
+                    <span class="search-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+                    </span>
+                    <label class="visually-hidden" for="fundCode">基金代码</label>
+                    <input id="fundCode" class="search-input" type="text" inputmode="numeric" autocomplete="off"
+                        maxlength="6" placeholder="输入 6 位基金代码，如 000001" aria-describedby="searchError">
+                    <button id="searchBtn" class="btn btn-primary" type="submit">查询</button>
+                </form>
+                <p class="search-error" id="searchError" role="alert" hidden></p>
+
+                <div class="search-history" id="historySection" hidden>
+                    <div class="search-history-head">
                         <span>最近搜索</span>
-                        <button class="history-clear-btn" onclick="clearSearchHistory()" title="清空搜索历史">
-                            <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg></span>
-                            清空
-                        </button>
+                        <button id="clearHistoryBtn" class="text-btn" type="button">清空记录</button>
                     </div>
                     <div class="history-tags" id="searchHistory"></div>
                 </div>
             </div>
-        </div>
 
-        <!-- 估值结果 -->
-        <div id="fundResult" class="card" style="display: none;">
-            <div class="card-header">
-                <div class="card-header-left">
-                    <div class="card-icon"><span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21.21 15.89A10 10 0 1 1 8 2.83"/><path d="M22 12A10 10 0 0 0 12 2v10z"/></svg></span></div>
-                    <h2 class="card-title">估值结果</h2>
-                </div>
-                <button class="icon-btn" id="closeFundResultBtn" type="button" aria-label="关闭估值结果" title="关闭">
-                    <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>
-                </button>
-            </div>
-            <div id="fundInfo"></div>
-        </div>
-
-        <!-- 持仓汇总 -->
-        <div id="summarySection" class="card" style="display: none;">
-            <div class="card-header">
-                <div class="card-header-left">
-                    <div class="card-icon"><span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12V7H5a2 2 0 0 1 0-4h14v4"/><path d="M3 5v14a2 2 0 0 0 2 2h16v-5"/><path d="M18 12a2 2 0 0 0 0 4h4v-4z"/></svg></span></div>
-                    <h2 class="card-title">持仓概览</h2>
-                </div>
-            </div>
-            <div class="card-body">
-                <div class="summary-grid" id="summaryGrid"></div>
+            <div class="topbar-status" id="tradingStatus" aria-live="polite">
+                <span class="trading-state"><span class="status-dot"></span><span>加载中</span></span>
             </div>
         </div>
+    </header>
 
-        <!-- 自选基金 -->
-        <div class="card">
-            <div class="card-header">
-                <div class="card-header-left">
-                    <div class="card-icon" style="background: var(--amber-50); color: var(--amber-500);"><span class="svg-icon"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/></svg></span></div>
-                    <h2 class="card-title">自选基金</h2>
+    <main id="main" class="page">
+        <section id="summarySection" class="portfolio" aria-labelledby="summaryTitle" hidden>
+            <div class="portfolio-head">
+                <h2 id="summaryTitle" class="section-title">持仓概览</h2>
+                <span class="section-note">按最新净值与盘中估值测算</span>
+            </div>
+            <div class="summary-grid" id="summaryGrid"></div>
+        </section>
+
+        <section class="ledger" aria-labelledby="ledgerTitle">
+            <div class="ledger-head">
+                <div class="ledger-heading">
+                    <h1 id="ledgerTitle" class="page-title">自选基金</h1>
+                    <p class="ledger-sub" id="favoritesMeta">加载中…</p>
                 </div>
-                <div class="section-controls">
-                    <button id="refreshFavoritesBtn" class="btn btn-secondary btn-sm">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span>刷新
+                <div class="toolbar">
+                    <button id="refreshFavoritesBtn" class="btn btn-secondary btn-sm" type="button" title="刷新全部自选">
+                        <span class="svg-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg></span>
+                        刷新
                     </button>
-                    <button id="sortFavoritesBtn" class="btn btn-secondary btn-sm">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="16" y2="12"/><line x1="4" y1="18" x2="12" y2="18"/><polyline points="18 15 21 18 18 21"/><line x1="21" y1="15" x2="21" y2="18"/></svg></span>排序
+                    <button id="sortFavoritesBtn" class="btn btn-secondary btn-sm" type="button" title="按今日估算涨幅从高到低排序">
+                        <span class="svg-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="4" y1="6" x2="20" y2="6"/><line x1="4" y1="12" x2="16" y2="12"/><line x1="4" y1="18" x2="12" y2="18"/><polyline points="18 15 21 18 18 21"/><line x1="21" y1="15" x2="21" y2="18"/></svg></span>
+                        排序
                     </button>
                     <button id="backupBtn" class="btn btn-secondary btn-sm" type="button" title="导出或导入本地数据">
-                        <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></span>数据
+                        <span class="svg-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg></span>
+                        数据
                     </button>
-                    <div class="refresh-toggle">
-                        <span>自动刷新</span>
-                        <label class="toggle">
-                            <input type="checkbox" id="autoRefreshSwitch">
-                            <span class="toggle-track"></span>
+                    <div class="auto-refresh">
+                        <label class="switch" title="关闭后隐藏持仓金额与今日估算收益">
+                            <input type="checkbox" id="positionVisibilitySwitch">
+                            <span class="switch-track" aria-hidden="true"></span>
+                            <span class="switch-label">显示持仓</span>
                         </label>
-                        <span id="refreshInterval">5分钟</span>
+                        <label class="switch">
+                            <input type="checkbox" id="autoRefreshSwitch">
+                            <span class="switch-track" aria-hidden="true"></span>
+                            <span class="switch-label">自动刷新</span>
+                        </label>
+                        <span class="auto-refresh-interval" id="refreshInterval">5分钟</span>
                     </div>
                 </div>
             </div>
-            <div class="card-body" style="padding: 0;">
-                <!-- 表格 -->
-                <div class="table-wrap" style="border: none; border-radius: 0;">
-                    <table class="table">
-                        <colgroup>
-                            <col class="col-name">
-                            <col class="col-nav">
-                            <col class="col-change">
-                            <col class="col-change">
-                            <col class="col-date">
-                            <col class="col-profit">
-                            <col class="col-action">
-                        </colgroup>
+
+            <div class="table-card">
+                <div class="table-wrap">
+                    <table class="ledger-table">
                         <thead>
                             <tr>
-                                <th style="padding-left: 2.5rem;">基金信息</th>
-                                <th style="text-align: right;">参考净值</th>
-                                <th style="text-align: right;" title="有盘中估值时显示估值涨幅；无估值时显示最新净值日涨跌">估算涨幅</th>
-                                <th style="text-align: right;">日涨跌</th>
-                                <th>净值日期</th>
-                                <th style="text-align: right;">估算收益</th>
-                                <th style="text-align: center;">操作</th>
+                                <th scope="col">基金</th>
+                                <th scope="col" class="num">参考净值</th>
+                                <th scope="col" class="num" title="有盘中估值时显示估值涨幅；无估值时显示最新净值日涨跌">估算涨幅</th>
+                                <th scope="col" class="num">日涨跌</th>
+                                <th scope="col" class="num col-date">净值日期</th>
+                                <th scope="col" class="num">持仓</th>
+                                <th scope="col" class="num">今日估算收益</th>
+                                <th scope="col" class="col-actions">操作</th>
                             </tr>
                         </thead>
                         <tbody id="favoritesList"></tbody>
                     </table>
                 </div>
 
-                <!-- 移动端卡片 -->
-                <div class="mobile-list" id="favoritesCardList" style="padding: 1rem;"></div>
+                <div class="mobile-list" id="favoritesCardList"></div>
 
-                <!-- 空状态 -->
-                <div id="emptyFavorites" class="empty" style="display: none;">
-                    <div class="empty-icon"><span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg></span></div>
-                    <p class="empty-title">暂无自选基金</p>
-                    <p class="empty-desc">搜索并添加关注的基金，或从备份恢复已有数据</p>
+                <div id="emptyFavorites" class="empty" hidden>
+                    <div class="empty-icon" aria-hidden="true">
+                        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 16 12 14 15 10 15 8 12 2 12"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+                    </div>
+                    <h2 class="empty-title">还没有自选基金</h2>
+                    <p class="empty-desc">输入 6 位基金代码搜索，添加后即可在这里查看盘中估值与今日估算收益；也可以从本地备份恢复。</p>
                     <div class="empty-actions">
-                        <button class="btn btn-primary" onclick="document.getElementById('fundCode').focus()">
-                            <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg></span>去搜索
-                        </button>
-                        <button id="restoreBackupBtn" class="btn btn-secondary" type="button">
-                            <span class="svg-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg></span>从备份恢复
-                        </button>
+                        <button id="emptySearchBtn" class="btn btn-primary" type="button">去搜索</button>
+                        <button id="restoreBackupBtn" class="btn btn-secondary" type="button">从备份恢复</button>
                     </div>
                 </div>
             </div>
-        </div>
+
+            <p class="ledger-foot">
+                盘中估值为按持仓或关联行情测算的参考值，实际净值以基金公司公布为准。数据来源：东方财富基金 / 天天基金。
+            </p>
+        </section>
     </main>
 
-    <!-- 底部 -->
-    <footer class="footer">
-        <p>盘中估值为按持仓或关联行情测算的参考值，实际净值以基金公司公布为准<br>数据来源：东方财富基金 / 天天基金</p>
-    </footer>
+    <dialog id="fundDrawer" class="drawer" aria-labelledby="drawerTitle">
+        <div class="drawer-head">
+            <div class="drawer-heading">
+                <p class="drawer-eyebrow" id="drawerEyebrow">搜索结果</p>
+                <h2 class="drawer-title" id="drawerTitle">基金</h2>
+                <p class="drawer-sub" id="drawerSub"></p>
+            </div>
+            <div class="drawer-head-actions">
+                <button class="btn btn-ghost drawer-back" id="drawerBack" type="button" hidden>返回</button>
+                <button class="icon-btn drawer-close" id="drawerClose" type="button" aria-label="关闭" title="关闭">
+                    <span class="svg-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></span>
+                </button>
+            </div>
+        </div>
+        <div class="drawer-body" id="drawerBody"></div>
+        <div class="drawer-foot" id="drawerFoot" hidden></div>
+    </dialog>
 
     <script src="app-utils.js"></script>
     <script src="app.js"></script>

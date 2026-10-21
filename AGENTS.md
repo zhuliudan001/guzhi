@@ -63,6 +63,7 @@ Gunicorn 使用 `gthread`（2 workers × 8 threads），监听 `127.0.0.1:5000`�
 
 - **颜色语义**：红涨绿跌（中国股市习惯），见 CSS 中 `.positive` / `.negative`。
 - **估算语义**：`gsz` 表示“当前参考净值”（有盘中估值时用估值，否则用最新净值）；`gszzl` 仅在有估值时作为盘中估值展示；无估值时自选列表的估值列回退展示最新净值日涨跌并标注“净值”；`jzzzl` 为最新净值日涨跌。
+- **持仓显示开关**：工具条「显示持仓」关闭时，隐藏持仓概览、表格的持仓/今日估算收益两列、卡片收益与持仓、以及所有编辑持仓入口；抽屉底部同时去掉「编辑持仓」。仅影响展示，不删除数据，也不改变收益计算。
 - **并发控制**：批量基础数据最多 5 线程，避免被上游限流。
 - **超时设置**：后端单次请求 10 秒；前端基础/批量 15 秒，详情 30 秒。
 - **错误映射**：基金不存在 → 404；上游不可用 → 502；未知异常 → 通用 500，不泄露内部细节。
@@ -73,7 +74,7 @@ Gunicorn 使用 `gthread`（2 workers × 8 threads），监听 `127.0.0.1:5000`�
 ## 数据备份
 
 - 入口：自选基金卡片头部的“数据”按钮，空状态中的“从备份恢复”。备份完全在浏览器本地完成，不上传服务器。
-- 备份格式：`{ app: "guzhi", version: 1, exportedAt, data: { favorites, searchHistory, autoRefreshEnabled } }`，导出文件名 `guzhi-backup-YYYY-MM-DD.json`。
+- 备份格式：`{ app: "guzhi", version: 1, exportedAt, data: { favorites, searchHistory, autoRefreshEnabled } }`，导出文件名 `guzhi-backup-YYYY-MM-DD.json`。`showPositions` 是本地显示偏好，不进入备份。
 - 校验：仅接受 `app === "guzhi"` 且 `version === 1`；基金代码必须为 6 位数字，名称非空且不超过 100 字符，持仓为非负数；最多 200 只自选、10 条搜索记录；文件最大 1MB。无效记录忽略并在预览中计数，不会中断整份导入。
 - 去重：自选同一代码以最后一条为准，搜索历史以第一条为准。
 - 合并导入：保留本机自选顺序，同代码用备份中的名称和持仓覆盖，备份独有的基金追加到末尾；保留本机自动刷新设置。
@@ -105,7 +106,7 @@ node --test tests/app-utils.test.js           # 前端共享逻辑
 
 ## 注意事项
 
-- 自选基金、持仓金额和搜索历史保存在浏览器 localStorage（`fundFavorites` / `searchHistory` / `autoRefreshEnabled`）。
+- 自选基金、持仓金额、搜索历史和自动刷新设置保存在浏览器 localStorage（`fundFavorites` / `searchHistory` / `autoRefreshEnabled`）；「显示持仓」偏好保存在 `showPositions`，缺失时默认开启。
 - 换设备或清理浏览器前，先通过“数据 → 导出备份”保存 JSON 文件；备份包含持仓金额，请勿公开分享。
 - 所有动态内容在插入 HTML 前必须经过 `escapeHtml` / `escapeAttr`。
 - 盘中估值是参考值，实际净值以基金公司公布为准；没有估值的基金不展示伪造的收益。
