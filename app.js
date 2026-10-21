@@ -29,6 +29,10 @@ const MAX_BACKUP_FILE_SIZE = 1024 * 1024;
 let refreshTimer = null;
 let refreshTimerInterval = null;
 let currentTradingStatus = null;
+let valuationRequestId = 0;
+const DERIVED_ESTIMATE_TTL = 5 * 60 * 1000;
+const derivedEstimateCache = new Map();
+const derivedEstimatePending = new Map();
 
 // ========== Trading Status ==========
 async function checkTradingStatus() {
@@ -204,6 +208,39 @@ async function fetchFastValuationsChunked(codes) {
         if (result.status === 'fulfilled') Object.assign(map, result.value);
     });
     return map;
+}
+
+// 批量估值源不覆盖部分基金时，用详情里的重仓股估算补齐
+function getDerivedEstimate(code) {
+    const cached = derivedEstimateCache.get(code);
+    if (cached && cached.expiresAt > Date.now()) return Promise.resolve(cached.data);
+    if (derivedEstimatePending.has(code)) return derivedEstimatePending.get(code);
+
+    const pending = getFundDetail(code)
+        .then((detail) => {
+            const data = {
+                gsz: detail?.gsz,
+                gszzl: detail?.gszzl,
+                jzzzl: detail?.jzzzl,
+                dwjz: detail?.dwjz,
+                jzrq: detail?.jzrq,
+                gztime: detail?.gztime,
+                update_time: detail?.update_time,
+                has_estimate: !!detail?.has_estimate,
+            };
+            derivedEstimateCache.set(code, { data, expiresAt: Date.now() + DERIVED_ESTIMATE_TTL });
+            return data;
+        })
+        .catch(() => null)
+        .finally(() => { derivedEstimatePending.delete(code); });
+
+    derivedEstimatePending.set(code, pending);
+    return pending;
+}
+
+function canDeriveEstimates() {
+    if (!currentTradingStatus) return false;
+    return currentTradingStatus.status === 'trading' || currentTradingStatus.status === 'lunch_break';
 }
 
 // ========== Search History ==========
@@ -428,6 +465,12 @@ async function searchFund() {
             </div>
         `;
     }
+}
+
+function closeFundResult() {
+    searchRequestId++;
+    sessionStorage.removeItem('currentFundData');
+    document.getElementById('fundResult').style.display = 'none';
 }
 
 // ========== Fund Detail Dialog ==========
@@ -1110,6 +1153,7 @@ function toFundViewModel(base, data, position) {
 async function fetchBatchValuation(favs) {
     const codes = favs.map(f => f.code);
     const fetchedList = [];
+    const requestId = ++valuationRequestId;
 
     let fastMap = {};
     try {
@@ -1135,6 +1179,25 @@ async function fetchBatchValuation(favs) {
     Array.from(fundViewCache.keys()).forEach((code) => {
         if (!activeCodes.has(code)) fundViewCache.delete(code);
     });
+    Array.from(derivedEstimateCache.keys()).forEach((code) => {
+        if (!activeCodes.has(code)) derivedEstimateCache.delete(code);
+    });
+
+    const needsDerived = [];
+    const hasFastEstimate = favs.some(fav => fastMap[fav.code]?.has_estimate);
+    const mayDerive = hasFastEstimate || canDeriveEstimates();
+    favs.forEach((fav) => {
+        const base = fastMap[fav.code];
+        if (!base || base.has_estimate) return;
+        const cached = derivedEstimateCache.get(fav.code);
+        if (cached && cached.expiresAt > Date.now() && cached.data.has_estimate) {
+            fastMap[fav.code] = { ...base, ...cached.data };
+        } else if (mayDerive) {
+            needsDerived.push(fav);
+        }
+    });
+
+    if (requestId !== valuationRequestId) return;
 
     favs.forEach((fav, idx) => {
         const fundData = toFundViewModel(fav, fastMap[fav.code], fav.position);
@@ -1145,6 +1208,28 @@ async function fetchBatchValuation(favs) {
     });
 
     renderSummary(Array.from(fundViewCache.values()));
+
+    if (!needsDerived.length) return;
+
+    const derivedResults = await mapWithLimit(needsDerived.slice(0, 10), 3, async (fav) => {
+        const estimate = await getDerivedEstimate(fav.code);
+        return { code: fav.code, estimate };
+    });
+    if (requestId !== valuationRequestId) return;
+
+    let changed = false;
+    derivedResults.forEach(({ code, estimate }) => {
+        if (!estimate || !estimate.has_estimate) return;
+        const current = fundViewCache.get(code);
+        if (!current) return;
+        const idx = favs.findIndex(f => f.code === code);
+        const merged = { ...current, ...estimate, has_estimate: true };
+        fundViewCache.set(code, merged);
+        updateFundRow(merged, idx);
+        updateFundCard(merged, idx);
+        changed = true;
+    });
+    if (changed) renderSummary(Array.from(fundViewCache.values()));
 }
 
 function updateFundRow(f, idx) {
@@ -1807,6 +1892,7 @@ function openBackupDialog(options = {}) {
 function init() {
     document.getElementById('searchBtn').onclick = searchFund;
     document.getElementById('fundCode').onkeypress = (e) => { if (e.key === 'Enter') searchFund(); };
+    document.getElementById('closeFundResultBtn').onclick = closeFundResult;
     document.getElementById('clearHistoryBtn').onclick = clearSearchHistory;
     document.getElementById('refreshFavoritesBtn').onclick = () => { renderFavorites(); showToast('刷新中...', 'info'); };
     document.getElementById('sortFavoritesBtn').onclick = sortFavorites;
