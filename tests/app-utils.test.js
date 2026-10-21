@@ -4,6 +4,7 @@ const {
     calcProfit,
     summarizePortfolio,
     formatChange,
+    resolveEstimateChange,
     escapeHtml,
     escapeAttr,
     createBackup,
@@ -53,6 +54,35 @@ test('formatChange handles missing values', () => {
     assert.deepEqual(formatChange('--'), { value: '--', cls: 'neutral' });
     assert.deepEqual(formatChange('1.234'), { value: '1.23%', cls: 'positive' });
     assert.deepEqual(formatChange('-1.235'), { value: '-1.24%', cls: 'negative' });
+});
+
+test('resolveEstimateChange prefers the intraday estimate', () => {
+    assert.deepEqual(
+        resolveEstimateChange({ has_estimate: true, gszzl: '0.86', jzzzl: '1.20' }),
+        { value: '0.86%', cls: 'positive', fallback: false }
+    );
+});
+
+test('resolveEstimateChange falls back to the latest nav change', () => {
+    assert.deepEqual(
+        resolveEstimateChange({ has_estimate: false, gszzl: '1.28', jzzzl: '1.28' }),
+        { value: '1.28%', cls: 'neutral', fallback: true }
+    );
+    assert.deepEqual(
+        resolveEstimateChange({ has_estimate: false, jzzzl: 0 }),
+        { value: '0.00%', cls: 'neutral', fallback: true }
+    );
+});
+
+test('resolveEstimateChange keeps a dash when no usable change exists', () => {
+    assert.deepEqual(
+        resolveEstimateChange({ failed: true, jzzzl: '1.28' }),
+        { value: '--', cls: 'neutral', fallback: false }
+    );
+    assert.deepEqual(
+        resolveEstimateChange({ has_estimate: false, jzzzl: '--' }),
+        { value: '--', cls: 'neutral', fallback: false }
+    );
 });
 
 test('escapeHtml and escapeAttr neutralize markup and quotes', () => {

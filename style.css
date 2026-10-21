@@ -717,6 +717,13 @@ body {
     background: var(--gray-100);
 }
 
+.change-fallback-tag {
+    margin-left: 0.25rem;
+    font-size: 0.625rem;
+    font-weight: 500;
+    opacity: 0.75;
+}
+
 .profit-cell {
     font-family: var(--font-mono);
     font-weight: 500;

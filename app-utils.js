@@ -75,6 +75,17 @@
         return { value: `${text}%`, cls };
     }
 
+    function resolveEstimateChange(fund) {
+        const source = fund && typeof fund === 'object' ? fund : {};
+        if (source.failed) return { value: '--', cls: 'neutral', fallback: false };
+        if (source.has_estimate) {
+            return { ...formatChange(source.gszzl), fallback: false };
+        }
+        const navChange = formatChange(source.jzzzl);
+        if (navChange.value === '--') return { value: '--', cls: 'neutral', fallback: false };
+        return { value: navChange.value, cls: 'neutral', fallback: true };
+    }
+
     function escapeHtml(value) {
         if (value === null || value === undefined) return '';
         return String(value)
@@ -233,6 +244,7 @@
         calcProfit,
         summarizePortfolio,
         formatChange,
+        resolveEstimateChange,
         escapeHtml,
         escapeAttr,
         createBackup,

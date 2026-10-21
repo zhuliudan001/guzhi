@@ -14,6 +14,7 @@ const {
     calcProfit,
     summarizePortfolio,
     formatChange,
+    resolveEstimateChange,
     escapeHtml,
     escapeAttr,
     createBackup,
@@ -1236,10 +1237,13 @@ function updateFundRow(f, idx) {
     const row = document.querySelector(`#favoritesList tr[data-code="${f.code}"]`);
     if (!row) return;
 
-    const ch = formatChange(f.gszzl);
+    const ch = resolveEstimateChange(f);
     const jzCh = formatChange(f.jzzzl || 0);
     const p = calcProfit(f.position, f.gsz, f.dwjz, !!f.has_estimate);
     const pCls = p.has ? (p.profit >= 0 ? 'positive' : 'negative') : '';
+    const fallbackTitle = ch.fallback
+        ? `无盘中估值，显示 ${f.jzrq && f.jzrq !== '--' ? f.jzrq : '最新'} 净值日涨跌`
+        : '';
 
     row.innerHTML = `
         <td>
@@ -1253,7 +1257,7 @@ function updateFundRow(f, idx) {
         </td>
         <td class="text-right mono">${escapeHtml(f.gsz || '--')}</td>
         <td class="text-right">
-            <span class="change-badge ${f.failed || !f.has_estimate ? 'neutral' : ch.cls}">${f.failed || !f.has_estimate ? '--' : escapeHtml(ch.value)}</span>
+            <span class="change-badge ${ch.cls}"${fallbackTitle ? ` title="${escapeAttr(fallbackTitle)}"` : ''}>${escapeHtml(ch.value)}${ch.fallback ? '<span class="change-fallback-tag">净值</span>' : ''}</span>
         </td>
         <td class="text-right">
             <span class="change-badge ${f.failed ? 'neutral' : jzCh.cls}">${f.failed ? '--' : escapeHtml(jzCh.value)}</span>
@@ -1277,10 +1281,13 @@ function updateFundCard(f, idx) {
     const card = document.querySelector(`#favoritesCardList .mobile-card[data-code="${f.code}"]`);
     if (!card) return;
 
-    const ch = formatChange(f.gszzl);
+    const ch = resolveEstimateChange(f);
     const jzCh = formatChange(f.jzzzl || 0);
     const p = calcProfit(f.position, f.gsz, f.dwjz, !!f.has_estimate);
     const pCls = p.has ? (p.profit >= 0 ? 'positive' : 'negative') : '';
+    const fallbackTitle = ch.fallback
+        ? `无盘中估值，显示 ${f.jzrq && f.jzrq !== '--' ? f.jzrq : '最新'} 净值日涨跌`
+        : '';
 
     card.innerHTML = `
         <div class="mobile-card-top">
@@ -1305,7 +1312,7 @@ function updateFundCard(f, idx) {
             </div>
             <div>
                 <div class="mobile-stat-label">估算涨幅</div>
-                <div class="mobile-stat-value ${f.has_estimate ? ch.cls : ''}">${f.failed || !f.has_estimate ? '--' : escapeHtml(ch.value)}</div>
+                <div class="mobile-stat-value ${ch.cls}"${fallbackTitle ? ` title="${escapeAttr(fallbackTitle)}"` : ''}>${escapeHtml(ch.value)}${ch.fallback ? '<span class="change-fallback-tag">净值</span>' : ''}</div>
             </div>
             <div>
                 <div class="mobile-stat-label">日涨跌</div>
