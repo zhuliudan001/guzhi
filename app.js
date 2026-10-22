@@ -1513,7 +1513,7 @@ function updateFundCard(f) {
         </div>
         <div class="fund-card-grid">
             <div>
-                <div class="stat-label">${f.has_estimate ? '估算净值' : '最新净值'}</div>
+                <div class="stat-label">参考净值</div>
                 <div class="stat-value" data-field="nav">${escapeHtml(f.gsz || '--')}</div>
             </div>
             <div>

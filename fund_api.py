@@ -228,6 +228,34 @@ def _fmt_num(value):
     return f'{number:.2f}' if number is not None else '--'
 
 
+def _normalize_quote_day(value):
+    """把行情时间戳归一化为 YYYY-MM-DD；无法识别时返回 None。
+
+    腾讯行情 fields[30] 有三种写法：A 股／ETF 为 20261022094145，
+    港股为 2026/10/22 09:30:58，美股为 2026-10-21 17:15:59。
+    """
+    text = str(value or '').strip()
+    if len(text) >= 14 and text[:8].isdigit():
+        return f'{text[:4]}-{text[4:6]}-{text[6:8]}'
+    match = re.match(r'^(\d{4})[-/](\d{2})[-/](\d{2})', text)
+    if not match:
+        return None
+    return f'{match.group(1)}-{match.group(2)}-{match.group(3)}'
+
+
+def _quotes_are_newer(nav_date, quote_date):
+    """判断行情所属交易日是否晚于最新净值日期。
+
+    派生估值是把“当前行情涨跌”叠加到“最新净值”上，如果行情就属于该净值
+    所在的交易日（休市日、或当日净值已公布），叠加一次等于重复计算。
+    """
+    nav_day = _normalize_quote_day(nav_date)
+    quote_day = _normalize_quote_day(quote_date)
+    if not nav_day or not quote_day:
+        return True
+    return quote_day > nav_day
+
+
 def _extract_json(text):
     if not text:
         return None
@@ -342,7 +370,7 @@ def _get_etf_realtime_change(fund_name, headers):
         headers (dict): HTTP 请求头
 
     Returns:
-        float or None: ETF/指数 实时涨跌幅，失败返回 None
+        tuple: (估值涨跌幅或 None, 行情所属交易日或 None)
     """
     try:
         # 去掉"联接"及其后缀
@@ -358,7 +386,7 @@ def _get_etf_realtime_change(fund_name, headers):
             base
         )
         if not company_match:
-            return None
+            return None, None
 
         company = company_match.group(1)
         index_part = base[len(company):]
@@ -369,7 +397,7 @@ def _get_etf_realtime_change(fund_name, headers):
         core_index = core_index.strip()
 
         if not core_index:
-            return None
+            return None, None
 
         # 生成多个搜索关键词，尝试找到对应 ETF
         index_variants = [core_index]
@@ -431,7 +459,7 @@ def _get_etf_realtime_change(fund_name, headers):
                     if value and '~' in value:
                         fields = value.split('~')
                         if len(fields) > 32 and fields[32] and fields[32] != '0.00':
-                            return float(fields[32])
+                            return float(fields[32]), _normalize_quote_day(fields[30])
 
         # ETF 没有数据或找不到 ETF，尝试获取跟踪指数的数据（QDII 基金）
         index_code = _get_tracking_index_code(fund_name, core_index)
@@ -446,12 +474,12 @@ def _get_etf_realtime_change(fund_name, headers):
                         fields = value.split('~')
                         # 港股指数涨跌幅在不同位置
                         if len(fields) > 32 and fields[32] and fields[32] != '0.00':
-                            return float(fields[32])
+                            return float(fields[32]), _normalize_quote_day(fields[30])
 
     except Exception as e:
         logger.warning(f"获取 ETF/指数 实时涨跌幅失败: {e}")
 
-    return None
+    return None, None
 
 
 def _get_tracking_index_code(fund_name, core_index):
@@ -513,6 +541,7 @@ def get_fund_stock_estimate(code):
 
     result = {
         'estimated_change': None,
+        'quote_date': None,
         'stock_ratio': 0,
         'stocks': [],
         'sectors': [],
@@ -614,10 +643,11 @@ def get_fund_stock_estimate(code):
 
         if is_feeder_fund:
             # ETF联接基金：尝试获取对应 ETF 的实时涨跌幅
-            etf_change = _get_etf_realtime_change(fund_name, headers)
+            etf_change, etf_quote_date = _get_etf_realtime_change(fund_name, headers)
             if etf_change is not None:
                 result['estimated_change'] = round(etf_change, 2)
                 result['etf_mode'] = True
+                result['quote_date'] = etf_quote_date
 
         # 提取重仓股代码
         stock_pattern = r'stockCodes\s*=\s*\[(.*?)\]'
@@ -662,6 +692,7 @@ def get_fund_stock_estimate(code):
                         if value and '~' in value:
                             fields = value.split('~')
                             if len(fields) > 30:
+                                result['quote_date'] = result['quote_date'] or _normalize_quote_day(fields[30])
                                 stock_info = {
                                     'code': fields[2],
                                     'name': fields[1],
@@ -691,7 +722,7 @@ def get_fund_stock_estimate(code):
                     pass
 
                 # 计算加权涨幅（ETF联接基金已通过 ETF 获取，跳过）
-                if stocks_data and not result.get('etf_mode'):
+                if stocks_data and not result.get('etf_mode') and result['stock_ratio'] > 0:
                     # 优先使用真实持仓比例，否则用默认权重
                     has_real_weights = any(s.get('weight', 0) > 0 for s in stocks_data[:10])
                     if has_real_weights:
@@ -939,21 +970,25 @@ def get_fast_valuation(code):
 
 
 def _valuation_payload(record):
-    """把内部估值记录转换为前端使用的基础字段。"""
+    """把内部估值记录转换为前端使用的基础字段。
+
+    gsz 与基础数据接口保持一致：始终是“当前参考净值”，无估值时为最新净值。
+    """
+    has_estimate = bool(record.get('has_estimate'))
     return {
         'code': record.get('code', ''),
         'name': record.get('name', ''),
-        'gsz': _fmt_nav(record.get('estimated_nav')),
+        'gsz': _fmt_nav(record.get('estimated_nav') if has_estimate else record.get('nav')),
         'gszzl': _fmt_num(record.get('estimated_change')),
         'jzzzl': _fmt_num(record.get('nav_change')),
         'dwjz': _fmt_nav(record.get('nav')),
         'gztime': record.get('estimate_time') or '--',
         'jzrq': record.get('nav_date') or '--',
         'source': 'tiantian',
-        'has_estimate': bool(record.get('has_estimate')),
+        'has_estimate': has_estimate,
         'has_realtime': bool(record.get('has_realtime')),
         'estimated_change': record.get('estimated_change'),
-        'estimate_source': 'official' if record.get('has_estimate') else None,
+        'estimate_source': 'official' if has_estimate else None,
     }
 
 
@@ -1066,7 +1101,7 @@ def get_fund_detail(code):
     if not payload.get('has_estimate'):
         change = estimate.get('estimated_change')
         latest_nav = _to_float(payload.get('dwjz'))
-        if change is not None and latest_nav:
+        if change is not None and latest_nav and _quotes_are_newer(payload.get('jzrq'), estimate.get('quote_date')):
             payload['gsz'] = _fmt_nav(latest_nav * (1 + change / 100))
             payload['gszzl'] = _fmt_num(change)
             payload['estimated_change'] = change

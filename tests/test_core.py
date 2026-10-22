@@ -71,6 +71,13 @@ class HelperTests(unittest.TestCase):
         self.assertIsNone(fund_api._extract_json('not json'))
         self.assertIsNone(fund_api._extract_json(''))
 
+    def test_normalize_quote_day(self):
+        self.assertEqual(fund_api._normalize_quote_day('20261022094145'), '2026-10-22')
+        self.assertEqual(fund_api._normalize_quote_day('2026/10/22 09:30:58'), '2026-10-22')
+        self.assertEqual(fund_api._normalize_quote_day('2026-10-21 17:15:59'), '2026-10-21')
+        for value in (None, '', '--', '0', 'abc', 123):
+            self.assertIsNone(fund_api._normalize_quote_day(value), value)
+
 
 class MarketStatusTests(unittest.TestCase):
     def at(self, year, month, day, hour, minute=0, tz=fund_api.SHANGHAI_TZ):
@@ -177,6 +184,17 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(payload['source'], 'tiantian')
         self.assertEqual(payload['estimate_source'], 'official')
 
+    def test_valuation_payload_falls_back_to_nav_without_estimate(self):
+        record = dict(self.fast, estimated_nav=None, estimated_change=None,
+                      has_estimate=False, has_realtime=False)
+        payload = fund_api._valuation_payload(record)
+        # gsz 与基础数据接口保持一致：始终表示“当前参考净值”
+        self.assertEqual(payload['gsz'], '1.0000')
+        self.assertEqual(payload['dwjz'], '1.0000')
+        self.assertEqual(payload['gszzl'], '--')
+        self.assertFalse(payload['has_estimate'])
+        self.assertIsNone(payload['estimate_source'])
+
 
 class FetchTests(unittest.TestCase):
     def setUp(self):
@@ -256,9 +274,9 @@ class FetchTests(unittest.TestCase):
         base = {
             'code': '000001', 'name': '测试基金', 'dwjz': '1.0000',
             'gsz': '1.0000', 'gszzl': '0.00', 'gztime': '2026-10-17',
-            'has_estimate': False, 'source': 'eastmoney',
+            'jzrq': '2026-10-21', 'has_estimate': False, 'source': 'eastmoney',
         }
-        estimate = {'estimated_change': -0.5, 'stock_ratio': 0.9}
+        estimate = {'estimated_change': -0.5, 'stock_ratio': 0.9, 'quote_date': '2026-10-22'}
         fund_api.DETAIL_CACHE.clear()
         with patch.object(fund_api, 'get_fund_data', return_value=base), \
                 patch.object(fund_api, 'get_fund_stock_estimate', return_value=estimate):
@@ -269,6 +287,73 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(payload['gztime'], payload['update_time'])
         self.assertTrue(payload['update_time'].startswith('20'))
         self.assertEqual(payload['estimate_source'], 'derived')
+
+    def test_detail_skips_derived_estimate_when_quotes_are_not_newer(self):
+        # 休市日：行情仍停留在最新净值所属的那个交易日，再叠加一次就是重复计算
+        base = {
+            'code': '000001', 'name': '测试基金', 'dwjz': '1.0000',
+            'gsz': '1.0000', 'gszzl': '-2.00', 'jzzzl': '-2.00', 'gztime': '2026-10-23',
+            'jzrq': '2026-10-23', 'has_estimate': False, 'source': 'eastmoney',
+            'estimated_change': None, 'estimate_source': None,
+        }
+        estimate = {'estimated_change': -1.8, 'stock_ratio': 0.87, 'quote_date': '2026-10-23'}
+        fund_api.DETAIL_CACHE.clear()
+        with patch.object(fund_api, 'get_fund_data', return_value=base), \
+                patch.object(fund_api, 'get_fund_stock_estimate', return_value=estimate):
+            payload = fund_api.get_fund_detail('000001')
+        self.assertFalse(payload['has_estimate'])
+        self.assertEqual(payload['gsz'], '1.0000')
+        self.assertEqual(payload['gszzl'], '-2.00')
+        self.assertIsNone(payload['estimate_source'])
+
+    def test_detail_skips_derived_estimate_when_nav_already_covers_today(self):
+        # 交易日净值已公布：行情日与净值日相同，派生值会把当日涨跌叠加两次
+        base = {
+            'code': '000001', 'name': '测试基金', 'dwjz': '2.7410',
+            'gsz': '2.7410', 'gszzl': '-2.07', 'jzzzl': '-2.07', 'gztime': '2026-10-22',
+            'jzrq': '2026-10-22', 'has_estimate': False, 'source': 'eastmoney',
+            'estimated_change': None, 'estimate_source': None,
+        }
+        estimate = {'estimated_change': -0.87, 'stock_ratio': 0.87, 'quote_date': '20261022094145'}
+        fund_api.DETAIL_CACHE.clear()
+        with patch.object(fund_api, 'get_fund_data', return_value=base), \
+                patch.object(fund_api, 'get_fund_stock_estimate', return_value=estimate):
+            payload = fund_api.get_fund_detail('000001')
+        self.assertFalse(payload['has_estimate'])
+        self.assertEqual(payload['gsz'], '2.7410')
+        self.assertIsNone(payload['estimate_source'])
+
+    def test_stock_estimate_ignores_unparsable_stock_ratio(self):
+        body = 'var fS_name = "测试混合基金";var stockCodes=["6005191","0003330"];'
+        holdings = (
+            '<tr><td>1</td><td><a>600519</a></td><td>a</td><td>b</td><td>c</td><td>d</td><td>9.77%</td></tr>'
+            '<tr><td>2</td><td><a>000333</a></td><td>a</td><td>b</td><td>c</td><td>d</td><td>8.10%</td></tr>'
+        )
+
+        def quote(codes):
+            lines = []
+            for market_code in codes.split(','):
+                fields = (['1', '行情', market_code[2:]] + ['0'] * 27
+                          + ['20261022094145', '-7.69', '5.00'] + ['0'] * 5)
+                lines.append('v_%s="%s"' % (market_code, '~'.join(fields)))
+            return '\n'.join(lines)
+
+        def fake_get(url, **kwargs):
+            if 'pingzhongdata' in url:
+                return FakeResponse(text=body)
+            if 'qt.gtimg.cn' in url:
+                return FakeResponse(text=quote(url.split('=')[-1]))
+            if 'FundArchivesDatas' in url:
+                return FakeResponse(text=holdings)
+            return FakeResponse(text='')
+
+        with patch.object(fund_api.requests, 'get', side_effect=fake_get):
+            estimate = fund_api.get_fund_stock_estimate('999999')
+
+        self.assertEqual(estimate['stock_ratio'], 0)
+        self.assertEqual(len(estimate['stocks']), 2)
+        # 占净比不可用时不产出 0.00% 这种伪测算
+        self.assertIsNone(estimate['estimated_change'])
 
     def test_fund_data_keeps_fast_estimate_without_nav(self):
         fast = {
