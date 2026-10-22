@@ -35,9 +35,18 @@ test('summarizePortfolio values estimated positions correctly', () => {
     assert.equal(summary.count, 2);
     assert.equal(summary.estimatedCount, 1);
     assert.ok(Math.abs(summary.totalPosition - 1500) < 1e-9);
+    assert.ok(Math.abs(summary.estimatedPosition - 1000) < 1e-9);
     assert.ok(Math.abs(summary.totalMarketValue - 1600) < 1e-9);
     assert.ok(Math.abs(summary.totalProfit - 100) < 1e-9);
-    assert.ok(Math.abs(summary.totalProfitRate - (100 / 1500) * 100) < 1e-9);
+    assert.ok(Math.abs(summary.totalProfitRate - 10) < 1e-9);
+});
+
+test('summarizePortfolio reports no rate when nothing has an estimate', () => {
+    const summary = summarizePortfolio([
+        { position: 1000, dwjz: 1.0, gsz: 1.0, has_estimate: false },
+    ]);
+    assert.equal(summary.estimatedPosition, 0);
+    assert.equal(summary.totalProfitRate, 0);
 });
 
 test('summarizePortfolio ignores empty positions and invalid nav', () => {

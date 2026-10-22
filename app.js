@@ -37,17 +37,12 @@ const derivedEstimatePending = new Map();
 // ========== Trading Status ==========
 async function checkTradingStatus() {
     try {
-        const timestamp = Date.now();
-        const response = await axios.get(`${API_BASE_URL}/trading-status`, {
-            timeout: 5000,
-            params: { _t: timestamp }
-        });
-        currentTradingStatus = response.data;
+        currentTradingStatus = await fetchApi(`/trading-status?_t=${Date.now()}`, { timeout: 5000 });
         updateTradingStatusUI();
         if (refreshTimer && refreshTimerInterval !== getRefreshInterval()) {
             startAutoRefresh();
         }
-        return response.data;
+        return currentTradingStatus;
     } catch (e) {
         console.warn('获取交易状态失败:', e);
         return null;
@@ -154,21 +149,32 @@ function isFavorite(code) {
 }
 
 // ========== API Functions ==========
-async function requestJson(path, config = {}) {
+async function fetchApi(path, { method = 'GET', body, timeout = 15000 } = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeout);
     try {
-        const response = await axios.get(`${API_BASE_URL}${path}`, {
-            timeout: 20000,
-            params: { _t: Date.now() },
-            ...config,
+        const response = await fetch(`${API_BASE_URL}${path}`, {
+            method,
+            headers: body === undefined ? undefined : { 'Content-Type': 'application/json' },
+            body: body === undefined ? undefined : JSON.stringify(body),
+            signal: controller.signal,
         });
-        if (!response.data?.success) {
-            throw new Error(response.data?.error || '请求失败');
+        const payload = await response.json().catch(() => null);
+        if (!payload?.success) {
+            throw new Error(payload?.error || `请求失败（${response.status}）`);
         }
-        return response.data.data;
+        return payload;
     } catch (error) {
-        const serverMessage = error?.response?.data?.error;
-        throw new Error(serverMessage || error?.message || '网络请求失败');
+        if (error.name === 'AbortError') throw new Error('请求超时，请稍后重试');
+        throw error;
+    } finally {
+        clearTimeout(timer);
     }
+}
+
+async function requestJson(path, options = {}) {
+    const payload = await fetchApi(`${path}?_t=${Date.now()}`, options);
+    return payload.data;
 }
 
 async function getFundData(code) {
@@ -183,16 +189,13 @@ async function getFundDetail(code) {
 
 async function fetchFastValuations(codes) {
     if (!codes.length) return {};
-    const response = await axios.post(`${API_BASE_URL}/funds/fast`, { codes }, {
+    const payload = await fetchApi(`/funds/fast?_t=${Date.now()}`, {
+        method: 'POST',
+        body: { codes },
         timeout: 15000,
-        headers: { 'Content-Type': 'application/json' },
-        params: { _t: Date.now() },
     });
-    if (!response.data?.success) {
-        throw new Error(response.data?.error || '批量估值获取失败');
-    }
     const map = {};
-    (response.data.data || []).forEach((item) => { map[item.code] = item; });
+    (Array.isArray(payload.data) ? payload.data : []).forEach((item) => { map[item.code] = item; });
     return map;
 }
 
@@ -207,6 +210,24 @@ async function fetchFastValuationsChunked(codes) {
     results.forEach((result) => {
         if (result.status === 'fulfilled') Object.assign(map, result.value);
     });
+    return map;
+}
+
+async function fetchBatchFunds(codes) {
+    const map = {};
+    for (let i = 0; i < codes.length; i += 20) {
+        try {
+            const payload = await fetchApi(`/funds/batch?_t=${Date.now()}`, {
+                method: 'POST',
+                body: { codes: codes.slice(i, i + 20) },
+                timeout: 15000,
+            });
+            (Array.isArray(payload.data) ? payload.data : []).forEach((item) => { map[item.code] = item; });
+        } catch (e) {
+            console.warn('批量基础数据接口失败:', e);
+            break;
+        }
+    }
     return map;
 }
 
@@ -227,6 +248,7 @@ function getDerivedEstimate(code) {
                 gztime: detail?.gztime,
                 update_time: detail?.update_time,
                 has_estimate: !!detail?.has_estimate,
+                estimate_source: detail?.estimate_source || null,
             };
             derivedEstimateCache.set(code, { data, expiresAt: Date.now() + DERIVED_ESTIMATE_TTL });
             return data;
@@ -245,6 +267,7 @@ function canDeriveEstimates() {
 
 // ========== Search History ==========
 let historyOpen = false;
+let historyDismissed = false;
 
 function saveSearchHistory(code, name) {
     let h = getStorage('searchHistory', []);
@@ -298,10 +321,14 @@ function renderHistory() {
 }
 
 function removeSearchHistory(code) {
+    const hadFocus = document.activeElement?.dataset?.remove === code;
     let h = getStorage('searchHistory', []);
     h = h.filter(i => i.code !== code);
     setStorage('searchHistory', h);
     renderHistory();
+    if (!hadFocus) return;
+    const next = document.querySelector('#searchHistory .history-main');
+    (next || document.getElementById('fundCode'))?.focus({ preventScroll: true });
 }
 
 function clearSearchHistory() {
@@ -309,6 +336,7 @@ function clearSearchHistory() {
     historyOpen = false;
     renderHistory();
     showToast('已清空搜索记录', 'success');
+    document.getElementById('fundCode')?.focus({ preventScroll: true });
 }
 
 function setSearchError(message) {
@@ -426,15 +454,50 @@ function changeCls(value) {
     return num > 0 ? 'positive' : 'negative';
 }
 
+function getEstimateMeta(fund) {
+    if (fund?.has_estimate && fund.estimate_source === 'derived') {
+        return {
+            tag: '测算参考',
+            accent: false,
+            navLabel: '测算净值',
+            changeLabel: '测算参考涨幅',
+            timeLabel: '测算时间',
+        };
+    }
+    if (fund?.has_estimate) {
+        return {
+            tag: '盘中估值',
+            accent: true,
+            navLabel: '估算净值',
+            changeLabel: '盘中估算涨幅',
+            timeLabel: '估值时间',
+        };
+    }
+    return {
+        tag: '最新净值',
+        accent: false,
+        navLabel: '最新净值',
+        changeLabel: '最新净值日涨跌',
+        timeLabel: '净值日期',
+    };
+}
+
+function estimateSourceTag(fund, fallback) {
+    if (fallback || !fund?.has_estimate) return '';
+    if (fund.estimate_source !== 'derived') return '';
+    return '<span class="fallback-tag" title="由重仓股行情测算，非官方估值">测算</span>';
+}
+
 // ========== Drawer: search result ==========
 function renderSearchResult(fund) {
     drawerState.view = 'search';
     drawerState.fund = fund;
     const hasEstimate = !!fund.has_estimate;
+    const estimate = getEstimateMeta(fund);
     const nav = getDisplayNav(fund);
     const ch = hasEstimate ? formatChange(fund.gszzl) : formatChange(fund.jzzzl);
-    const changeLabel = hasEstimate ? '盘中估算涨幅' : '最新净值日涨跌';
-    const timeLabel = hasEstimate ? '估值时间' : '净值日期';
+    const changeLabel = estimate.changeLabel;
+    const timeLabel = estimate.timeLabel;
     const updateTime = fund.update_time || fund.gztime || fund.jzrq || '--';
     const favorite = isFavorite(fund.code);
 
@@ -455,7 +518,7 @@ function renderSearchResult(fund) {
         <div class="fund-hero">
             <div class="fund-hero-top">
                 <div>
-                    <div class="fund-hero-label">${hasEstimate ? '估算净值' : '最新净值'}</div>
+                    <div class="fund-hero-label">${estimate.navLabel}</div>
                     <div class="fund-nav">${escapeHtml(nav)}</div>
                 </div>
                 <div class="fund-hero-change">
@@ -464,7 +527,7 @@ function renderSearchResult(fund) {
                 </div>
             </div>
             <div class="fund-meta-row">
-                <span class="tag ${hasEstimate ? 'tag-accent' : ''}">${hasEstimate ? '盘中估值' : '最新净值'}</span>
+                <span class="tag ${estimate.accent ? 'tag-accent' : ''}">${estimate.tag}</span>
                 <span class="tag">净值日期 ${escapeHtml(fund.jzrq || '--')}</span>
                 ${fund.ljjz ? `<span class="tag">累计净值 ${escapeHtml(fund.ljjz)}</span>` : ''}
             </div>
@@ -569,9 +632,10 @@ async function showFundDetail(code, options = {}) {
 
 function renderFundDetail(fund) {
     const hasEstimate = !!fund.has_estimate;
+    const estimate = getEstimateMeta(fund);
     const nav = getDisplayNav(fund);
     const ch = hasEstimate ? formatChange(fund.gszzl) : formatChange(fund.jzzzl);
-    const changeLabel = hasEstimate ? '盘中估算涨幅' : '最新净值日涨跌';
+    const changeLabel = estimate.changeLabel;
     const favorite = isFavorite(fund.code);
     const stockPct = fund.stock_ratio ? Number(fund.stock_ratio) * 100 : null;
     const bondPct = fund.asset_allocation ? Number(fund.asset_allocation.bond) : null;
@@ -599,7 +663,7 @@ function renderFundDetail(fund) {
         <div class="fund-hero">
             <div class="fund-hero-top">
                 <div>
-                    <div class="fund-hero-label">${hasEstimate ? '估算净值' : '最新净值'}</div>
+                    <div class="fund-hero-label">${estimate.navLabel}</div>
                     <div class="fund-nav">${escapeHtml(nav)}</div>
                 </div>
                 <div class="fund-hero-change">
@@ -608,7 +672,7 @@ function renderFundDetail(fund) {
                 </div>
             </div>
             <div class="fund-meta-row">
-                <span class="tag ${hasEstimate ? 'tag-accent' : ''}">${hasEstimate ? '盘中估值' : '最新净值'}</span>
+                <span class="tag ${estimate.accent ? 'tag-accent' : ''}">${estimate.tag}</span>
                 <span class="tag">净值日期 ${escapeHtml(fund.jzrq || '--')}</span>
                 <span class="tag">申购 ${escapeHtml(fund.sgzt || '--')}</span>
                 <span class="tag">赎回 ${escapeHtml(fund.shzt || '--')}</span>
@@ -632,7 +696,7 @@ function renderFundDetail(fund) {
                     <div class="metric-value">${escapeHtml(fund.ljjz || '--')}</div>
                 </div>
                 <div class="metric">
-                    <div class="metric-label">${hasEstimate ? '估值时间' : '更新时间'}</div>
+                    <div class="metric-label">${estimate.timeLabel}</div>
                     <div class="metric-value" style="font-size: 12px;">${escapeHtml(fund.update_time || fund.gztime || '--')}</div>
                 </div>
             </div>
@@ -735,7 +799,38 @@ function renderFundDetail(fund) {
     });
     document.getElementById('detailRefresh')?.addEventListener('click', () => showFundDetail(fund.code));
 
-    if (hasChart) renderNavTrendChart(fund.nav_trend);
+    if (hasChart) {
+        loadChartJs()
+            .then(() => {
+                if (drawerState.view === 'detail' && drawerState.fund?.code === fund.code) {
+                    renderNavTrendChart(fund.nav_trend);
+                }
+            })
+            .catch(() => {
+                const box = document.querySelector('.chart-box');
+                if (box) box.innerHTML = '<p class="chart-fallback">走势图加载失败，请检查网络后重试。</p>';
+            });
+    }
+}
+
+const CHART_JS_URL = 'https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js';
+let chartJsPromise = null;
+
+function loadChartJs() {
+    if (window.Chart) return Promise.resolve(window.Chart);
+    if (chartJsPromise) return chartJsPromise;
+    chartJsPromise = new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = CHART_JS_URL;
+        script.async = true;
+        script.onload = () => (window.Chart ? resolve(window.Chart) : reject(new Error('Chart.js 初始化失败')));
+        script.onerror = () => reject(new Error('走势图组件加载失败'));
+        document.head.appendChild(script);
+    }).catch((error) => {
+        chartJsPromise = null;
+        throw error;
+    });
+    return chartJsPromise;
 }
 
 function renderNavTrendChart(navTrend) {
@@ -894,11 +989,14 @@ function getFavoriteActions(f) {
 }
 
 function getFavoriteCardActions(f) {
+    const code = escapeAttr(f.code);
+    const name = escapeAttr(f.name);
     return `
         <div class="fund-card-actions">
-            <button class="icon-btn" type="button" data-action="refresh" data-code="${escapeAttr(f.code)}" title="刷新估值" aria-label="刷新估值">${icon('sync-alt')}</button>
-            <button class="icon-btn" type="button" data-action="edit" data-code="${escapeAttr(f.code)}" data-name="${escapeAttr(f.name)}" data-pos="${f.position || 0}" title="编辑持仓" aria-label="编辑持仓">${icon('edit')}</button>
-            <button class="icon-btn danger" type="button" data-action="remove" data-code="${escapeAttr(f.code)}" title="移除自选" aria-label="移除自选">${icon('trash-alt')}</button>
+            <button class="icon-btn" type="button" data-action="refresh" data-code="${code}" title="刷新估值" aria-label="刷新 ${name} 的估值">${icon('sync-alt')}</button>
+            <button class="icon-btn" type="button" data-action="detail" data-code="${code}" title="查看详情" aria-label="查看 ${name} 的详情">${icon('chart-line')}</button>
+            <button class="icon-btn" type="button" data-action="edit" data-code="${code}" data-name="${name}" data-pos="${f.position || 0}" title="编辑持仓" aria-label="编辑 ${name} 的持仓">${icon('edit')}</button>
+            <button class="icon-btn danger" type="button" data-action="remove" data-code="${code}" title="移除自选" aria-label="将 ${name} 移出自选">${icon('trash-alt')}</button>
         </div>
     `;
 }
@@ -1059,7 +1157,7 @@ function editPosition(code, name, current = 0) {
         <div class="dialog-body">
             <label class="field-label" for="posInput">持仓金额（元）</label>
             <input type="number" id="posInput" class="dialog-input" placeholder="0.00" value="${current > 0 ? current.toFixed(2) : ''}" step="0.01" min="0" inputmode="decimal">
-            <p class="field-hint">持仓金额作为当前成本，用于估算今日收益；填 0 表示仅关注。</p>
+            <p class="field-hint">按最新净值填写当前持仓金额，用于估算今日变动；填 0 表示仅关注。该数字不是累计盈亏。</p>
             <p class="field-error" id="posError" role="alert" hidden></p>
         </div>
         <div class="dialog-footer">
@@ -1149,24 +1247,24 @@ function renderSummary(fundList) {
     section.hidden = false;
     grid.innerHTML = `
         <div class="summary-item">
-            <div class="summary-label">总投入</div>
+            <div class="summary-label">当前持仓</div>
             <div class="summary-value">¥${formatMoney(summary.totalPosition)}</div>
-            <div class="summary-change">${summary.count} 只持仓基金</div>
+            <div class="summary-change">${summary.count} 只持仓基金 · 按最新净值计</div>
         </div>
         <div class="summary-item">
             <div class="summary-label">估算市值</div>
             <div class="summary-value">¥${formatMoney(summary.totalMarketValue)}</div>
-            <div class="summary-change">无估值基金按持仓成本计</div>
+            <div class="summary-change">无估值基金按当前持仓计</div>
         </div>
         <div class="summary-item">
             <div class="summary-label">今日估算收益</div>
             <div class="summary-value ${profitClass}">${formatProfit(summary.totalProfit)}</div>
-            <div class="summary-change ${rateClass}">${formatRate(summary.totalProfitRate)} · 仅统计有盘中估值的基金</div>
+            <div class="summary-change ${rateClass}">${formatRate(summary.totalProfitRate)} · 仅统计有估值/测算的基金</div>
         </div>
         <div class="summary-item">
             <div class="summary-label">持仓数量</div>
             <div class="summary-value">${summary.count} 只</div>
-            <div class="summary-change">${summary.estimatedCount} 只有盘中估值</div>
+            <div class="summary-change">${summary.estimatedCount} 只有估值/测算</div>
         </div>
     `;
 }
@@ -1183,7 +1281,7 @@ function updateFavoritesMeta() {
     const views = Array.from(fundViewCache.values()).filter(v => codes.has(v.code));
     const estimated = views.filter(v => v.has_estimate).length;
     const latest = views.map(v => v.update_time).filter(Boolean).sort().pop();
-    el.textContent = `${favs.length} 只基金 · ${estimated} 只有盘中估值${latest ? ` · 估值时间 ${latest}` : ''}`;
+    el.textContent = `${favs.length} 只基金 · ${estimated} 只有估值/测算${latest ? ` · 估值时间 ${latest}` : ''}`;
 }
 
 function renderFavorites(force = false) {
@@ -1253,21 +1351,17 @@ async function fetchBatchValuation(favs) {
     try {
         fastMap = await fetchFastValuationsChunked(codes);
     } catch (e) {
-        console.warn('批量估值接口失败，降级到单个请求:', e);
+        console.warn('批量估值接口失败，降级到批量基础数据:', e);
     }
 
     const missing = favs.filter(fav => !fastMap[fav.code]);
 
-    const fallbackResults = await mapWithLimit(missing, 5, async (fav) => {
-        try {
-            return { code: fav.code, data: await getFundData(fav.code) };
-        } catch {
-            return { code: fav.code, data: null };
-        }
-    });
-    fallbackResults.forEach(({ code, data }) => {
-        if (data) fastMap[code] = data;
-    });
+    if (missing.length) {
+        const fallbackMap = await fetchBatchFunds(missing.map(fav => fav.code));
+        missing.forEach((fav) => {
+            if (fallbackMap[fav.code]) fastMap[fav.code] = fallbackMap[fav.code];
+        });
+    }
 
     const activeCodes = new Set(codes);
     Array.from(fundViewCache.keys()).forEach((code) => {
@@ -1328,9 +1422,27 @@ async function fetchBatchValuation(favs) {
     }
 }
 
+function captureListFocus(container) {
+    const active = document.activeElement;
+    if (!active || !container.contains(active)) return null;
+    return {
+        action: active.dataset?.action || '',
+        dragHandle: active.classList.contains('drag-handle'),
+    };
+}
+
+function restoreListFocus(container, focus) {
+    if (!focus) return;
+    const target = focus.action
+        ? container.querySelector(`[data-action="${focus.action}"]`)
+        : (focus.dragHandle ? container.querySelector('.drag-handle') : null);
+    target?.focus({ preventScroll: true });
+}
+
 function updateFundRow(f) {
     const row = document.querySelector(`#favoritesList tr[data-code="${f.code}"]`);
     if (!row) return;
+    const focus = captureListFocus(row);
 
     const ch = resolveEstimateChange(f);
     const jzCh = formatChange(f.jzzzl);
@@ -1341,6 +1453,11 @@ function updateFundRow(f) {
         : '';
     const navTitle = f.update_time ? `估值时间 ${f.update_time}` : (f.jzrq ? `净值日期 ${f.jzrq}` : '');
     const position = Number(f.position) > 0 ? `¥${formatMoney(f.position)}` : '未填';
+    const dailyCell = f.failed
+        ? '<span class="change neutral">--</span>'
+        : ch.fallback
+            ? '<span class="change neutral" title="无盘中估值，净值日涨跌已显示在估算涨幅列">—</span>'
+            : `<span class="change ${jzCh.cls}">${escapeHtml(jzCh.value)}</span>`;
 
     row.innerHTML = `
         <td>
@@ -1354,19 +1471,21 @@ function updateFundRow(f) {
         </td>
         <td class="num" data-field="nav"><span class="nav-value">${escapeHtml(f.gsz || '--')}</span></td>
         <td class="num" data-field="estimate">
-            <span class="change ${ch.fallback ? 'is-fallback' : ch.cls}"${fallbackTitle ? ` title="${escapeAttr(fallbackTitle)}"` : ''}>${escapeHtml(ch.value)}${ch.fallback ? '<span class="fallback-tag">净值</span>' : ''}</span>
+            <span class="change ${ch.fallback ? 'is-fallback' : ch.cls}"${fallbackTitle ? ` title="${escapeAttr(fallbackTitle)}"` : ''}>${escapeHtml(ch.value)}${ch.fallback ? '<span class="fallback-tag">净值</span>' : estimateSourceTag(f, ch.fallback)}</span>
         </td>
-        <td class="num" data-field="daily"><span class="change ${f.failed ? 'neutral' : jzCh.cls}">${f.failed ? '--' : escapeHtml(jzCh.value)}</span></td>
+        <td class="num" data-field="daily">${dailyCell}</td>
         <td class="num date-cell" data-field="date" title="${escapeAttr(navTitle)}">${escapeHtml(f.jzrq || '--')}</td>
         <td class="num position-cell ${position === '未填' ? 'is-empty' : ''}">${position}</td>
         <td class="num profit-cell ${pCls}" data-field="profit">${p.has ? formatProfit(p.profit) : '--'}</td>
         <td>${getFavoriteActions(f)}</td>
     `;
+    restoreListFocus(row, focus);
 }
 
 function updateFundCard(f) {
     const card = document.querySelector(`#favoritesCardList .fund-card[data-code="${f.code}"]`);
     if (!card) return;
+    const focus = captureListFocus(card);
 
     const ch = resolveEstimateChange(f);
     const jzCh = formatChange(f.jzzzl);
@@ -1377,6 +1496,8 @@ function updateFundCard(f) {
         : '';
     const date = f.jzrq && f.jzrq !== '--' ? f.jzrq : '暂无净值日期';
     const positionText = Number(f.position) > 0 ? `持仓 ¥${formatMoney(f.position)}` : '持仓未填';
+    const dailyText = f.failed ? '--' : (ch.fallback ? '—' : escapeHtml(jzCh.value));
+    const dailyTitle = ch.fallback ? ' title="无盘中估值，净值日涨跌已显示在估算涨幅列"' : '';
 
     card.innerHTML = `
         <div class="fund-card-top">
@@ -1397,11 +1518,11 @@ function updateFundCard(f) {
             </div>
             <div>
                 <div class="stat-label">估算涨幅</div>
-                <div class="stat-value change ${ch.fallback ? 'is-fallback' : ch.cls}" data-field="estimate"${fallbackTitle ? ` title="${escapeAttr(fallbackTitle)}"` : ''}>${escapeHtml(ch.value)}${ch.fallback ? '<span class="fallback-tag">净值</span>' : ''}</div>
+                <div class="stat-value change ${ch.fallback ? 'is-fallback' : ch.cls}" data-field="estimate"${fallbackTitle ? ` title="${escapeAttr(fallbackTitle)}"` : ''}>${escapeHtml(ch.value)}${ch.fallback ? '<span class="fallback-tag">净值</span>' : estimateSourceTag(f, ch.fallback)}</div>
             </div>
             <div>
                 <div class="stat-label">日涨跌</div>
-                <div class="stat-value change ${f.failed ? 'neutral' : jzCh.cls}" data-field="daily">${f.failed ? '--' : escapeHtml(jzCh.value)}</div>
+                <div class="stat-value change ${f.failed || ch.fallback ? 'neutral' : jzCh.cls}" data-field="daily"${dailyTitle}>${dailyText}</div>
             </div>
         </div>
         <div class="fund-card-foot">
@@ -1409,9 +1530,10 @@ function updateFundCard(f) {
             ${getFavoriteCardActions(f)}
         </div>
     `;
+    restoreListFocus(card, focus);
 }
 
-function refreshSingleFund(code) {
+async function refreshSingleFund(code) {
     const favs = getStorage('fundFavorites', []);
     const fav = favs.find(f => f.code === code);
     if (!fav) return;
@@ -1427,15 +1549,22 @@ function refreshSingleFund(code) {
         });
     });
 
-    getFundData(code).then(data => {
-        const fundData = toFundViewModel(fav, data, fav.position || 0);
+    try {
+        const data = await getFundData(code);
+        let fundData = toFundViewModel(fav, data, fav.position || 0);
+        if (!fundData.has_estimate) {
+            const estimate = await getDerivedEstimate(code);
+            if (estimate && estimate.has_estimate) {
+                fundData = { ...fundData, ...estimate, has_estimate: true };
+            }
+        }
         fundViewCache.set(code, fundData);
         updateFundRow(fundData);
         updateFundCard(fundData);
         renderSummary(Array.from(fundViewCache.values()));
         updateFavoritesMeta();
         showToast('刷新成功', 'success');
-    }).catch(() => {
+    } catch {
         const failedData = { code, name: fav.name, position: fav.position || 0, dwjz: '--', gszzl: 0, jzzzl: 0, jzrq: '--', failed: true };
         fundViewCache.set(code, failedData);
         updateFundRow(failedData);
@@ -1443,7 +1572,7 @@ function refreshSingleFund(code) {
         renderSummary(Array.from(fundViewCache.values()));
         updateFavoritesMeta();
         showToast('刷新失败', 'error');
-    });
+    }
 }
 
 let favoriteEventsBound = false;
@@ -1490,30 +1619,61 @@ function bindFavoriteEvents() {
     });
 }
 
-async function sortFavorites() {
+let sortDirection = 'desc';
+
+function sortFavorites() {
     const favs = getStorage('fundFavorites', []);
     if (!favs.length) { showToast('暂无自选', 'info'); return; }
 
-    showToast('排序中…', 'info');
-    try {
-        const fastMap = await fetchFastValuationsChunked(favs.map(f => f.code));
-        const sorted = favs.map((fav) => {
-            const data = fastMap[fav.code];
-            const cached = fundViewCache.get(fav.code);
-            const model = data && (data.has_estimate || !cached)
-                ? toFundViewModel(fav, data, fav.position)
-                : cached;
-            const change = model ? Number.parseFloat(resolveEstimateChange(model).value) : NaN;
-            return { fav, change: Number.isFinite(change) ? change : 0 };
-        }).sort((a, b) => b.change - a.change);
-        setStorage('fundFavorites', sorted.map(({ fav }) => ({
+    const direction = sortDirection;
+    const ranked = favs.map((fav) => {
+        const model = fundViewCache.get(fav.code);
+        const change = model && model.has_estimate && !model.failed
+            ? Number.parseFloat(model.gszzl)
+            : NaN;
+        return { fav, change: Number.isFinite(change) ? change : null };
+    }).sort((a, b) => {
+        if (a.change === null && b.change === null) return 0;
+        if (a.change === null) return 1;
+        if (b.change === null) return -1;
+        return direction === 'desc' ? b.change - a.change : a.change - b.change;
+    });
+
+    const codes = ranked.map(({ fav }) => fav.code);
+    const tbody = document.getElementById('favoritesList');
+    if (tbody.querySelector('tr[data-code]')) {
+        applyFavoriteOrder(codes);
+    } else {
+        setStorage('fundFavorites', ranked.map(({ fav }) => ({
             code: fav.code,
             name: fav.name,
             position: fav.position || 0,
         })));
-        renderFavorites(true);
-        showToast('已按今日估算涨幅排序', 'success');
-    } catch { showToast('排序失败', 'error'); }
+        renderFavorites();
+    }
+
+    sortDirection = direction === 'desc' ? 'asc' : 'desc';
+    updateSortButton();
+    showToast(`已按今日估算涨幅${direction === 'desc' ? '从高到低' : '从低到高'}排序，无估值基金置后`, 'success');
+}
+
+function applyFavoriteOrder(codes) {
+    const tbody = document.getElementById('favoritesList');
+    const cards = document.getElementById('favoritesCardList');
+    const rows = new Map(Array.from(tbody.querySelectorAll('tr[data-code]')).map(row => [row.dataset.code, row]));
+    const cardEls = new Map(Array.from(cards.querySelectorAll('.fund-card[data-code]')).map(card => [card.dataset.code, card]));
+    codes.forEach((code) => {
+        const row = rows.get(code);
+        const card = cardEls.get(code);
+        if (row) tbody.appendChild(row);
+        if (card) cards.appendChild(card);
+    });
+    saveOrderFromDOM();
+}
+
+function updateSortButton() {
+    const btn = document.getElementById('sortFavoritesBtn');
+    if (btn) btn.title = `按今日估算涨幅从${sortDirection === 'desc' ? '高到低' : '低到高'}排序`;
 }
 
 function toggleAutoRefresh(enable, silent = false) {
@@ -1534,6 +1694,7 @@ function startAutoRefresh() {
     const interval = getRefreshInterval();
     refreshTimerInterval = interval;
     refreshTimer = setInterval(() => {
+        if (document.hidden) return;
         renderFavorites();
         checkTradingStatus();
     }, interval);
@@ -1945,25 +2106,70 @@ function init() {
 
     fundCode.addEventListener('input', () => {
         fundCode.value = fundCode.value.replace(/\D/g, '').slice(0, 6);
+        historyDismissed = false;
         setSearchError('');
     });
 
     fundCode.addEventListener('focus', () => {
+        if (historyDismissed) return;
+        historyOpen = true;
+        renderHistory();
+    });
+
+    fundCode.addEventListener('click', () => {
+        historyDismissed = false;
         historyOpen = true;
         renderHistory();
     });
 
     fundCode.addEventListener('keydown', (event) => {
+        if (event.key === 'ArrowDown') {
+            const first = document.querySelector('#searchHistory .history-main');
+            if (first) {
+                event.preventDefault();
+                first.focus();
+            }
+            return;
+        }
         if (event.key === 'Escape') {
+            historyDismissed = true;
             historyOpen = false;
             renderHistory();
             fundCode.blur();
         }
     });
 
+    const historyList = document.getElementById('searchHistory');
+    historyList.addEventListener('keydown', (event) => {
+        if (event.key === 'Escape') {
+            historyDismissed = true;
+            historyOpen = false;
+            fundCode.focus();
+            renderHistory();
+            return;
+        }
+        if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return;
+        const items = Array.from(historyList.querySelectorAll('.history-main'));
+        const index = items.indexOf(document.activeElement);
+        if (index === -1) return;
+        event.preventDefault();
+        const next = items[index + (event.key === 'ArrowDown' ? 1 : -1)];
+        if (next) next.focus();
+        else if (event.key === 'ArrowUp') fundCode.focus();
+    });
+
+    const searchArea = document.querySelector('.search-area');
+    searchArea?.addEventListener('focusout', (event) => {
+        if (searchArea.contains(event.relatedTarget)) return;
+        historyDismissed = false;
+        if (!historyOpen) return;
+        historyOpen = false;
+        renderHistory();
+    });
+
     document.getElementById('clearHistoryBtn').onclick = clearSearchHistory;
     document.getElementById('refreshFavoritesBtn').onclick = () => {
-        renderFavorites(true);
+        renderFavorites();
         showToast('正在刷新全部自选', 'info');
     };
     document.getElementById('sortFavoritesBtn').onclick = sortFavorites;
@@ -2010,6 +2216,12 @@ function init() {
     checkTradingStatus();
     renderHistory();
     renderFavorites();
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden || !refreshTimer) return;
+        renderFavorites();
+        checkTradingStatus();
+    });
 
     if (getStorage('autoRefreshEnabled')) {
         document.getElementById('autoRefreshSwitch').checked = true;

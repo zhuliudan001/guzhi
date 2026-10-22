@@ -156,6 +156,7 @@ class PayloadTests(unittest.TestCase):
         self.assertTrue(payload['has_estimate'])
         self.assertTrue(payload['has_realtime'])
         self.assertEqual(payload['estimated_change'], 1.0)
+        self.assertEqual(payload['estimate_source'], 'official')
 
     def test_basic_payload_falls_back_to_nav(self):
         payload = fund_api._build_basic_payload('000001', self.meta, None, self.nav)
@@ -164,6 +165,7 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(payload['source'], 'eastmoney')
         self.assertFalse(payload['has_estimate'])
         self.assertFalse(payload['has_realtime'])
+        self.assertIsNone(payload['estimate_source'])
 
     def test_valuation_payload_maps_fast_record(self):
         payload = fund_api._valuation_payload(self.fast)
@@ -173,6 +175,7 @@ class PayloadTests(unittest.TestCase):
         self.assertEqual(payload['jzzzl'], '0.50')
         self.assertEqual(payload['gztime'], '2026-10-20 14:00')
         self.assertEqual(payload['source'], 'tiantian')
+        self.assertEqual(payload['estimate_source'], 'official')
 
 
 class FetchTests(unittest.TestCase):
@@ -265,6 +268,7 @@ class FetchTests(unittest.TestCase):
         self.assertEqual(payload['gszzl'], '-0.50')
         self.assertEqual(payload['gztime'], payload['update_time'])
         self.assertTrue(payload['update_time'].startswith('20'))
+        self.assertEqual(payload['estimate_source'], 'derived')
 
     def test_fund_data_keeps_fast_estimate_without_nav(self):
         fast = {
@@ -325,6 +329,14 @@ class RouteTests(unittest.TestCase):
     def test_batch_limit(self):
         response = self.client.post('/api/funds/batch', json={'codes': ['000001'] * 21})
         self.assertEqual(response.status_code, 400)
+
+    def test_oversized_payload_is_rejected(self):
+        body = json.dumps({'codes': ['000001'], 'padding': 'x' * (70 * 1024)})
+        response = self.client.post('/api/funds/batch', data=body, content_type='application/json')
+        self.assertEqual(response.status_code, 413)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertEqual(payload['error'], '请求体过大')
 
     def test_fast_batch_limit(self):
         response = self.client.post('/api/funds/fast', json={'codes': ['000001'] * 51})

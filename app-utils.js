@@ -37,6 +37,7 @@
             count: 0,
             estimatedCount: 0,
             totalPosition: 0,
+            estimatedPosition: 0,
             totalMarketValue: 0,
             totalProfit: 0,
             totalProfitRate: 0,
@@ -53,14 +54,17 @@
 
             const result = calcProfit(position, currentNav, costNav, true);
             summary.count += 1;
-            if (hasEstimate) summary.estimatedCount += 1;
+            if (hasEstimate) {
+                summary.estimatedCount += 1;
+                summary.estimatedPosition += position;
+            }
             summary.totalPosition += position;
             summary.totalMarketValue += result.marketValue;
             summary.totalProfit += result.profit;
         });
 
-        if (summary.totalPosition > 0) {
-            summary.totalProfitRate = (summary.totalProfit / summary.totalPosition) * 100;
+        if (summary.estimatedPosition > 0) {
+            summary.totalProfitRate = (summary.totalProfit / summary.estimatedPosition) * 100;
         }
         return summary;
     }

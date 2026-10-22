@@ -29,6 +29,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 64 * 1024
 
 # CORS 配置 - 生产域名 + 任意本地端口（本地调试时静态服务端口不固定）
 ALLOWED_ORIGINS = {'https://guzhi.itect.me'}
@@ -313,6 +314,11 @@ def handle_fund_not_found(e):
 def handle_upstream_error(e):
     logger.warning(f"上游数据源异常：{e}")
     return _api_error(str(e) or '数据源暂时不可用', 502)
+
+
+@app.errorhandler(413)
+def handle_payload_too_large(e):
+    return _api_error('请求体过大', 413)
 
 
 @app.errorhandler(HTTPException)
@@ -947,6 +953,7 @@ def _valuation_payload(record):
         'has_estimate': bool(record.get('has_estimate')),
         'has_realtime': bool(record.get('has_realtime')),
         'estimated_change': record.get('estimated_change'),
+        'estimate_source': 'official' if record.get('has_estimate') else None,
     }
 
 
@@ -978,6 +985,7 @@ def _build_basic_payload(code, meta, fast, nav):
             'has_estimate': True,
             'has_realtime': bool(fast.get('has_realtime', True)),
             'estimated_change': fast.get('estimated_change'),
+            'estimate_source': 'official',
         }
 
     return {
@@ -998,6 +1006,7 @@ def _build_basic_payload(code, meta, fast, nav):
         'has_estimate': False,
         'has_realtime': False,
         'estimated_change': None,
+        'estimate_source': None,
     }
 
 
@@ -1063,6 +1072,7 @@ def get_fund_detail(code):
             payload['estimated_change'] = change
             payload['has_estimate'] = True
             payload['source'] = 'eastmoney_estimate'
+            payload['estimate_source'] = 'derived'
             payload['update_time'] = datetime.now(SHANGHAI_TZ).strftime('%Y-%m-%d %H:%M')
             payload['gztime'] = payload['update_time']
 
@@ -1177,6 +1187,8 @@ def get_batch_funds():
             'message': f'成功获取 {len(results)} 只基金数据' + (f'，{len(failed_codes)} 只失败' if failed_codes else '')
         })
         
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"批量获取基金数据异常：{str(e)}\n{traceback.format_exc()}")
         return jsonify({

@@ -5,8 +5,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>基金估值查询 | 自选基金管理</title>
-    <script src="https://cdn.jsdelivr.net/npm/axios/dist/axios.min.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     <link rel="stylesheet" href="style.css">
 </head>
 
@@ -34,9 +32,9 @@
                 </form>
                 <p class="search-error" id="searchError" role="alert" hidden></p>
 
-                <div class="search-history" id="historySection" hidden>
+                <div class="search-history" id="historySection" hidden aria-labelledby="historyLabel">
                     <div class="search-history-head">
-                        <span>最近搜索</span>
+                        <span id="historyLabel">最近搜索</span>
                         <button id="clearHistoryBtn" class="text-btn" type="button">清空记录</button>
                     </div>
                     <div class="history-tags" id="searchHistory"></div>
@@ -50,6 +48,7 @@
     </header>
 
     <main id="main" class="page">
+        <h1 class="visually-hidden">基金估值查询</h1>
         <section id="summarySection" class="portfolio" aria-labelledby="summaryTitle" hidden>
             <div class="portfolio-head">
                 <h2 id="summaryTitle" class="section-title">持仓概览</h2>
@@ -61,7 +60,7 @@
         <section class="ledger" aria-labelledby="ledgerTitle">
             <div class="ledger-head">
                 <div class="ledger-heading">
-                    <h1 id="ledgerTitle" class="page-title">自选基金</h1>
+                    <h2 id="ledgerTitle" class="page-title">自选基金</h2>
                     <p class="ledger-sub" id="favoritesMeta">加载中…</p>
                 </div>
                 <div class="toolbar">
@@ -128,7 +127,7 @@
             </div>
 
             <p class="ledger-foot">
-                盘中估值为按持仓或关联行情测算的参考值，实际净值以基金公司公布为准。数据来源：东方财富基金 / 天天基金。
+                今日估算收益为相对最新净值的单日估算，不是累计盈亏。盘中估值为按持仓或关联行情测算的参考值，实际净值以基金公司公布为准。数据来源：东方财富基金 / 天天基金。
             </p>
         </section>
     </main>
